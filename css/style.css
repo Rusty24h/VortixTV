@@ -3797,3 +3797,91 @@ body.trailer-open #shaka-video {
     border-top: 1px solid rgba(148, 163, 184, 0.2);
     padding-top: 14px;
 }
+
+/* =========================================================================
+ * Application Exit Confirmation Modal (#exit-modal)
+ * ========================================================================= */
+.exit-modal-box {
+    width: 720px;
+    max-width: 90vw;
+    text-align: center;
+}
+.exit-modal-msg {
+    font-size: 21px;
+    line-height: 1.5;
+    color: #cbd5e1;
+    margin: 10px 0 22px 0;
+}
+.exit-modal-actions {
+    margin-top: 8px;
+}
+#btn-exit-confirm {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+}
+.exit-power-icon {
+    display: inline-block;
+    width: 20px;
+    height: 20px;
+    margin-right: 9px;
+    flex-shrink: 0;
+    vertical-align: middle;
+}
+.mode-power-icon {
+    display: inline-block;
+    width: 22px;
+    height: 22px;
+    margin-right: 12px;
+    flex-shrink: 0;
+    vertical-align: middle;
+    opacity: 0.92;
+}
+.exit-modal-hint {
+    margin-top: 18px;
+    padding-top: 12px;
+    border-top: 1px solid rgba(148, 163, 184, 0.22);
+    font-size: 16px;
+    color: #94a3b8;
+}
+
+/* =========================================================================
+ * Tizen OS 4.0 / Chromium M56 Performance Mode (body.tizen-legacy-perf)
+ * Eliminates expensive blurred multi-layer box-shadows, scale transforms,
+ * and filter repaints during rapid D-pad navigation on 2018-2019 TVs.
+ * ========================================================================= */
+body.tizen-legacy-perf .item,
+body.tizen-legacy-perf .poster-card,
+body.tizen-legacy-perf .action-pill,
+body.tizen-legacy-perf .quick-action-pill,
+body.tizen-legacy-perf .epg-grid-cell,
+body.tizen-legacy-perf .btn {
+    transition: none !important;
+}
+body.tizen-legacy-perf .item.selected,
+body.tizen-legacy-perf #tracks-list .item.selected {
+    transform: none !important;
+    box-shadow: none !important;
+    outline: 2px solid var(--accent-light, #60a5fa);
+    outline-offset: -2px;
+}
+body.tizen-legacy-perf .poster-card.selected {
+    transform: none !important;
+    box-shadow: none !important;
+    border-color: var(--accent-light, #60a5fa) !important;
+    outline: 3px solid var(--accent-light, #60a5fa);
+    outline-offset: -3px;
+}
+body.tizen-legacy-perf .action-pill.focused,
+body.tizen-legacy-perf .quick-action-pill.focused,
+body.tizen-legacy-perf .epg-grid-cell.focused,
+body.tizen-legacy-perf .btn.focused {
+    transform: none !important;
+    box-shadow: none !important;
+    filter: none !important;
+    outline: 2px solid var(--accent-light, #60a5fa);
+}
+body.tizen-legacy-perf .list-container,
+body.tizen-legacy-perf #epg-grid-rows {
+    contain: layout style;
+}
