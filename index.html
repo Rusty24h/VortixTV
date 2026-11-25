@@ -555,6 +555,20 @@
         </div>
     </div>
 
+    <!-- Clean Application Exit Confirmation Modal (Tizen 4.0+ Certified UX) -->
+    <div id="exit-modal" class="modal">
+        <div class="modal-box exit-modal-box">
+            <h2>Exit VortixTV?</h2>
+            <p id="exit-modal-msg" class="exit-modal-msg">Stop playback, close active streams, and exit VortixTV cleanly.</p>
+            <div class="btn-row exit-modal-actions">
+                <div id="btn-exit-confirm" class="btn btn-danger"><svg class="exit-power-icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" aria-hidden="true"><path d="M12 2v10"/><path d="M18.36 6.64a9 9 0 1 1-12.73 0"/></svg><span>Exit App</span></div>
+                <div id="btn-exit-fullscreen" class="btn btn-primary" style="display:none;">▶ Return to Video</div>
+                <div id="btn-exit-cancel" class="btn">Cancel</div>
+            </div>
+            <div class="exit-modal-hint">LEFT / RIGHT: Choose &bull; OK: Confirm &bull; BACK: Cancel</div>
+        </div>
+    </div>
+
     <!-- VOD 20-Second High-Stability Buffering Visual Overlay (Circle + Centered Percentage Only) -->
     <div id="vod-loading-overlay" class="vod-loading-overlay">
         <div class="vod-loading-spinner-wrap">
