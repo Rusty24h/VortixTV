@@ -12,6 +12,7 @@ var os = require('os');
 var dns = require('dns');
 var net = require('net');
 var crypto = require('crypto');
+var StringDecoder = require('string_decoder').StringDecoder;
 
 function ensureDirSyncSafe(dirPath) {
     if (!dirPath) {
@@ -369,6 +370,36 @@ function pruneProxyMemory() {
                 delete streamTelemetryMap[oldKey];
             }
         }
+        var dnsKeys = Object.keys(safeDnsCache);
+        if (dnsKeys.length > 64) {
+            var dnsNow = Date.now();
+            for (var dIdx = 0; dIdx < dnsKeys.length; dIdx++) {
+                var dRec = safeDnsCache[dnsKeys[dIdx]];
+                if (!dRec || (dnsNow - dRec.ts) >= SAFE_DNS_CACHE_TTL_MS) {
+                    delete safeDnsCache[dnsKeys[dIdx]];
+                }
+            }
+        }
+        var ckKeys = Object.keys(cookieJar);
+        if (ckKeys.length > 60) {
+            for (var ckIdx = 0; ckIdx < ckKeys.length - 40; ckIdx++) {
+                delete cookieJar[ckKeys[ckIdx]];
+            }
+        }
+        if (Array.isArray(xmltvCompactCacheKeys) && xmltvCompactCacheKeys.length > 0) {
+            var xmlNow = Date.now();
+            var keptXmlKeys = [];
+            for (var xk = 0; xk < xmltvCompactCacheKeys.length; xk++) {
+                var xKey = xmltvCompactCacheKeys[xk];
+                var xEntry = xmltvCompactCache[xKey];
+                if (!xEntry || (xmlNow - (xEntry.ts || 0)) > 1800000) {
+                    delete xmltvCompactCache[xKey];
+                } else {
+                    keptXmlKeys.push(xKey);
+                }
+            }
+            xmltvCompactCacheKeys = keptXmlKeys;
+        }
     } catch (ePrune) {}
 }
 var pruneTimer = setInterval(pruneProxyMemory, 60000);
@@ -469,6 +500,9 @@ function guardUpstreamSocketLookup(sock, reqToAbort) {
     });
 }
 
+var safeDnsCache = {};
+var SAFE_DNS_CACHE_TTL_MS = 60000;
+
 function validateSafeUpstreamUrl(rawUrl, callback) {
     var parsed;
     try {
@@ -496,6 +530,16 @@ function validateSafeUpstreamUrl(rawUrl, callback) {
         }
         return callback(null, safeTarget);
     }
+    var dnsKey = hostname.toLowerCase();
+    var cachedDns = safeDnsCache[dnsKey];
+    if (cachedDns && cachedDns.address && (Date.now() - cachedDns.ts) < SAFE_DNS_CACHE_TTL_MS) {
+        if (isBlockedUpstreamIp(cachedDns.address)) {
+            delete safeDnsCache[dnsKey];
+            return callback(new Error('SSRF Blocked: Restricted upstream IP ' + cachedDns.address));
+        }
+        safeTarget.resolvedIp = cachedDns.address;
+        return callback(null, safeTarget);
+    }
     dns.lookup(hostname, function(err, address) {
         if (err) {
             return callback(err);
@@ -503,9 +547,69 @@ function validateSafeUpstreamUrl(rawUrl, callback) {
         if (isBlockedUpstreamIp(address)) {
             return callback(new Error('SSRF Blocked: Restricted upstream IP ' + address));
         }
+        if (address) {
+            var curDnsKeys = Object.keys(safeDnsCache);
+            if (curDnsKeys.length >= 128) {
+                delete safeDnsCache[curDnsKeys[0]];
+            }
+            safeDnsCache[dnsKey] = { address: address, ts: Date.now() };
+        }
         safeTarget.resolvedIp = address || hostname;
         return callback(null, safeTarget);
     });
+}
+
+function mergeCookieStringsProxy(baseCookieStr, extraCookieStr) {
+    var map = {};
+    var order = [];
+    function ingest(raw) {
+        if (!raw) {
+            return;
+        }
+        var parts = String(raw).split(';');
+        for (var i = 0; i < parts.length; i++) {
+            var seg = parts[i].trim();
+            if (!seg) {
+                continue;
+            }
+            var eq = seg.indexOf('=');
+            if (eq <= 0) {
+                continue;
+            }
+            var name = seg.slice(0, eq).trim();
+            var val = seg.slice(eq + 1).trim();
+            if (!name) {
+                continue;
+            }
+            var low = name.toLowerCase();
+            if (!Object.prototype.hasOwnProperty.call(map, low)) {
+                order.push(low);
+            }
+            map[low] = name + '=' + val;
+        }
+    }
+    ingest(baseCookieStr);
+    ingest(extraCookieStr);
+    var out = [];
+    for (var j = 0; j < order.length; j++) {
+        out.push(map[order[j]]);
+    }
+    return out.join('; ');
+}
+
+function extractSetCookiePairsProxy(setCookieHeaders) {
+    if (!setCookieHeaders) {
+        return '';
+    }
+    var list = Array.isArray(setCookieHeaders) ? setCookieHeaders : [setCookieHeaders];
+    var pairs = [];
+    for (var i = 0; i < list.length; i++) {
+        var firstPart = String(list[i] || '').split(';')[0].trim();
+        if (firstPart && firstPart.indexOf('=') > 0) {
+            pairs.push(firstPart);
+        }
+    }
+    return pairs.join('; ');
 }
 
 function proxyDashAndDrmRequest(targetUrlStr, customHdrsObj, clientReq, clientRes, redirectsLeft) {
@@ -516,27 +620,12 @@ function proxyDashAndDrmRequest(targetUrlStr, customHdrsObj, clientReq, clientRe
         clientRes.end('Too many redirects');
         return;
     }
-    var reqBodyChunks = [];
-    var reqBodyLen = 0;
-    var aborted = false;
-    clientReq.on('error', function() {
-        aborted = true;
-        reqBodyChunks = [];
-    });
-    clientReq.on('data', function(chunk) {
-        var b = Buffer.isBuffer(chunk) ? chunk : allocBufferUtf8(chunk);
-        reqBodyLen += b.length;
-        if (reqBodyLen <= 2097152) {
-            reqBodyChunks.push(b);
-        }
-    });
-    clientReq.on('end', function() {
-        if (aborted) {
-            return;
-        }
-        var bodyBuf = reqBodyChunks.length > 0 ? Buffer.concat(reqBodyChunks) : null;
-        reqBodyChunks = [];
-        (function sendHop(candidateUrl, hopsLeft) {
+
+    var reqMethod = String((clientReq && clientReq.method) || 'GET').toUpperCase();
+    var hasNoBody = (reqMethod === 'GET' || reqMethod === 'HEAD');
+
+    function dispatchDashRequest(bodyBuf) {
+        (function sendHop(candidateUrl, hopsLeft, hopMethod, carriedCookies, allowClearKeyGetRetry) {
             validateSafeUpstreamUrl(candidateUrl, function(ssrfErr, safeTarget) {
                 if (ssrfErr || !safeTarget) {
                     if (!clientRes.headersSent) {
@@ -564,15 +653,18 @@ function proxyDashAndDrmRequest(targetUrlStr, customHdrsObj, clientReq, clientRe
                     }
                     targetObj[hName] = hVal;
                 }
-                function hasHeaderCaseInsensitive(targetObj, hName) {
+                function getHeaderCaseInsensitive(targetObj, hName) {
                     var lowTarget = String(hName || '').toLowerCase();
                     var existing = Object.keys(targetObj);
                     for (var ei = 0; ei < existing.length; ei++) {
                         if (existing[ei].toLowerCase() === lowTarget) {
-                            return true;
+                            return String(targetObj[existing[ei]] || '');
                         }
                     }
-                    return false;
+                    return '';
+                }
+                function hasHeaderCaseInsensitive(targetObj, hName) {
+                    return Boolean(getHeaderCaseInsensitive(targetObj, hName));
                 }
                 var skipReq = {
                     host: true,
@@ -613,30 +705,117 @@ function proxyDashAndDrmRequest(targetUrlStr, customHdrsObj, clientReq, clientRe
                         }
                     }
                 }
+                var explicitCookie = getHeaderCaseInsensitive(outHeaders, 'Cookie');
+                var jarDashCookie = getHostCookieHeader(safeTarget.hostname, '', 'dash');
+                var finalCookie = mergeCookieStringsProxy(jarDashCookie, explicitCookie);
+                if (carriedCookies) {
+                    finalCookie = mergeCookieStringsProxy(finalCookie, carriedCookies);
+                }
+                if (finalCookie) {
+                    setHeaderCaseInsensitive(outHeaders, 'Cookie', finalCookie);
+                }
                 if (!hasHeaderCaseInsensitive(outHeaders, 'User-Agent')) {
                     setHeaderCaseInsensitive(outHeaders, 'User-Agent', 'Mozilla/5.0 (SMART-TV; Linux; Tizen 5.5) AppleWebKit/537.36');
                 }
-                if (bodyBuf && bodyBuf.length > 0) {
-                    setHeaderCaseInsensitive(outHeaders, 'Content-Length', String(bodyBuf.length));
+                var sendBody = (hopMethod !== 'GET' && hopMethod !== 'HEAD' && bodyBuf && bodyBuf.length > 0) ? bodyBuf : null;
+                if (sendBody) {
+                    setHeaderCaseInsensitive(outHeaders, 'Content-Length', String(sendBody.length));
+                } else {
+                    var curCtKeys = Object.keys(outHeaders);
+                    for (var delIdx = 0; delIdx < curCtKeys.length; delIdx++) {
+                        if (curCtKeys[delIdx].toLowerCase() === 'content-length') {
+                            delete outHeaders[curCtKeys[delIdx]];
+                        }
+                    }
                 }
                 setHeaderCaseInsensitive(outHeaders, 'Host', safeTarget.host);
+                var activeDashUpReq = null;
+                var activeDashUpRes = null;
+                var cleanupDashListeners = function() {};
+                if (!clientReq._vortixDashCloseCleanup) {
+                    clientReq._vortixDashClientAborted = false;
+                    var onDashClientAbort = function() {
+                        clientReq._vortixDashClientAborted = true;
+                        if (clientReq._vortixActiveDashUpReq) {
+                            try { clientReq._vortixActiveDashUpReq.abort(); } catch (eAbReq) {}
+                            clientReq._vortixActiveDashUpReq = null;
+                        }
+                        if (clientReq._vortixActiveDashUpRes) {
+                            try { clientReq._vortixActiveDashUpRes.destroy(); } catch (eAbRes) {}
+                            clientReq._vortixActiveDashUpRes = null;
+                        }
+                    };
+                    clientReq._vortixDashCloseCleanup = function() {
+                        clientReq.removeListener('close', onDashClientAbort);
+                        clientRes.removeListener('close', onDashClientAbort);
+                        clientReq._vortixDashCloseCleanup = null;
+                        clientReq._vortixActiveDashUpReq = null;
+                        clientReq._vortixActiveDashUpRes = null;
+                    };
+                    clientReq.once('close', onDashClientAbort);
+                    clientRes.once('close', onDashClientAbort);
+                    clientRes.once('finish', clientReq._vortixDashCloseCleanup);
+                }
+                cleanupDashListeners = clientReq._vortixDashCloseCleanup || function() {};
+                if (!clientRes._vortixErrBound) {
+                    clientRes._vortixErrBound = true;
+                    clientRes.on('error', function() {});
+                }
                 var upReq = client.request({
                     hostname: safeTarget.resolvedIp || safeTarget.hostname,
                     port: safeTarget.port,
                     path: safeTarget.path,
-                    method: clientReq.method || 'GET',
+                    method: hopMethod,
                     headers: outHeaders,
                     servername: safeTarget.hostname,
                     agent: isHttps ? httpsAgent : httpAgent,
                     timeout: 20000,
                     rejectUnauthorized: false
                 }, function(upRes) {
+                    activeDashUpRes = upRes;
+                    clientReq._vortixActiveDashUpRes = upRes;
+                    if (clientReq._vortixDashClientAborted || clientRes.writableEnded || clientRes.finished) {
+                        try { upRes.destroy(); } catch (eAbLate) {}
+                        return;
+                    }
+                    upRes.on('error', function() {
+                        cleanupDashListeners();
+                        try {
+                            if (!clientRes.headersSent) {
+                                clientRes.writeHead(502, { 'Access-Control-Allow-Origin': '*', 'Content-Type': 'text/plain' });
+                            }
+                            clientRes.end();
+                        } catch (eUpResErr) {}
+                    });
                     var sc = Number(upRes.statusCode) || 502;
+                    var hopSetCookies = upRes.headers ? upRes.headers['set-cookie'] : null;
+                    var nextCarried = carriedCookies || '';
+                    if (hopSetCookies) {
+                        storeSetCookies(safeTarget.hostname, hopSetCookies, 'dash');
+                        var parsedHopCookies = extractSetCookiePairsProxy(hopSetCookies);
+                        if (parsedHopCookies) {
+                            nextCarried = mergeCookieStringsProxy(nextCarried, parsedHopCookies);
+                        }
+                    }
                     if ([301, 302, 303, 307, 308].indexOf(sc) !== -1 && upRes.headers && upRes.headers.location && hopsLeft > 1) {
                         var nextLoc = url.resolve(candidateUrl, upRes.headers.location);
+                        var nextMethod = (sc === 303 || ((sc === 301 || sc === 302) && hopMethod === 'POST')) ? 'GET' : hopMethod;
+                        clientReq._vortixActiveDashUpRes = null;
                         upRes.resume();
-                        sendHop(nextLoc, hopsLeft - 1);
+                        sendHop(nextLoc, hopsLeft - 1, nextMethod, nextCarried, allowClearKeyGetRetry);
                         return;
+                    }
+                    if (sc === 405 && hopMethod === 'POST' && allowClearKeyGetRetry && sendBody && sendBody.length <= 2048) {
+                        var bodyTxt = '';
+                        try {
+                            bodyTxt = sendBody.toString('utf8').trim();
+                        } catch (eBodyStr) {}
+                        if (bodyTxt.charAt(0) === '{' && bodyTxt.indexOf('"kids"') !== -1) {
+                            clientReq._vortixActiveDashUpRes = null;
+                            upRes.resume();
+                            sendHop(candidateUrl, hopsLeft, 'GET', nextCarried, false);
+                            return;
+                        }
                     }
                     var resHeaders = {
                         'Access-Control-Allow-Origin': '*',
@@ -669,28 +848,65 @@ function proxyDashAndDrmRequest(targetUrlStr, customHdrsObj, clientReq, clientRe
                     }
                     upRes.pipe(clientRes);
                 });
+                activeDashUpReq = upReq;
+                clientReq._vortixActiveDashUpReq = activeDashUpReq;
+                upReq.on('socket', function(sock) {
+                    guardUpstreamSocketLookup(sock, upReq);
+                    if (sock && typeof sock.setNoDelay === 'function') {
+                        try {
+                            sock.setNoDelay(true);
+                        } catch (eNd) {}
+                    }
+                });
                 upReq.on('error', function(eUp) {
+                    cleanupDashListeners();
                     if (!clientRes.headersSent) {
                         clientRes.writeHead(502, { 'Access-Control-Allow-Origin': '*', 'Content-Type': 'text/plain' });
                     }
                     try { clientRes.end('DASH/DRM Proxy error: ' + (eUp ? eUp.message : 'upstream failed')); } catch (eEnd) {}
                 });
                 upReq.on('timeout', function() {
+                    cleanupDashListeners();
                     try { upReq.abort(); } catch (eTo) {}
                     if (!clientRes.headersSent) {
                         clientRes.writeHead(504, { 'Access-Control-Allow-Origin': '*', 'Content-Type': 'text/plain' });
                     }
                     try { clientRes.end('DASH/DRM Proxy timeout'); } catch (eEnd2) {}
                 });
-                clientReq.once('close', function() {
-                    try { upReq.abort(); } catch (eAb) {}
-                });
-                if (bodyBuf && bodyBuf.length > 0) {
-                    upReq.write(bodyBuf);
+                if (sendBody) {
+                    upReq.write(sendBody);
                 }
                 upReq.end();
             });
-        })(targetUrlStr, redirectsLeft);
+        })(targetUrlStr, redirectsLeft, reqMethod, '', true);
+    }
+
+    if (hasNoBody) {
+        dispatchDashRequest(null);
+        return;
+    }
+
+    var reqBodyChunks = [];
+    var reqBodyLen = 0;
+    var aborted = false;
+    clientReq.on('error', function() {
+        aborted = true;
+        reqBodyChunks = [];
+    });
+    clientReq.on('data', function(chunk) {
+        var b = Buffer.isBuffer(chunk) ? chunk : allocBufferUtf8(chunk);
+        reqBodyLen += b.length;
+        if (reqBodyLen <= 2097152) {
+            reqBodyChunks.push(b);
+        }
+    });
+    clientReq.on('end', function() {
+        if (aborted) {
+            return;
+        }
+        var bodyBuf = reqBodyChunks.length > 0 ? Buffer.concat(reqBodyChunks) : null;
+        reqBodyChunks = [];
+        dispatchDashRequest(bodyBuf);
     });
 }
 
@@ -969,7 +1185,7 @@ function buildRemoteSetupHtml(endpointUrl) {
         '<script>',
         'var uploadedM3uName="";var uploadedM3uRaw="";var uploadedSubName="";var uploadedSubRaw="";var uploadedBackupRaw="";',
         'function syncType(){var t=document.getElementById("type").value;document.getElementById("grp-stalker").style.display=(t==="stalker"?"block":"none");document.getElementById("grp-xtream").style.display=(t==="xtream"?"block":"none");document.getElementById("grp-m3u").style.display=(t==="m3u"?"block":"none");}',
-        'function handleM3uFileSelect(){var inp=document.getElementById("m3uFile");var info=document.getElementById("m3uFileInfo");var f=inp&&inp.files?inp.files[0]:null;uploadedM3uName="";uploadedM3uRaw="";if(!f){if(info)info.textContent="No local playlist file selected";return;}if(!/\\.(m3u8?|txt)$/i.test(f.name)){if(info)info.textContent="⚠ Please choose a .m3u or .m3u8 file";return;}if(f.size>22020096){if(info)info.textContent="⚠ File exceeds 21 MB limit";return;}if(info)info.textContent="Reading "+f.name+"...";var r=new FileReader();r.onload=function(){var txt=String(r.result||"");if(txt.indexOf("#EXTM3U")===-1&&txt.indexOf("#EXTINF")===-1){if(info)info.textContent="⚠ Invalid M3U content (missing #EXTM3U / #EXTINF)";return;}uploadedM3uName=f.name;uploadedM3uRaw=txt;if(info)info.textContent="✓ Ready: "+f.name+" ("+Math.round(txt.length/1024)+" KB)";};r.readAsText(f);}',
+        'function handleM3uFileSelect(){var inp=document.getElementById("m3uFile");var info=document.getElementById("m3uFileInfo");var f=inp&&inp.files?inp.files[0]:null;uploadedM3uName="";uploadedM3uRaw="";if(!f){if(info)info.textContent="No local playlist file selected";return;}if(!/\\.(m3u8?|txt)$/i.test(f.name)){if(info)info.textContent="⚠ Please choose a .m3u or .m3u8 file";return;}if(f.size>22020096){if(info)info.textContent="⚠ File exceeds 21 MB limit";return;}if(info)info.textContent="Reading "+f.name+"...";var r=new FileReader();r.onload=function(){var txt=String(r.result||"");if(!/#ext/i.test(txt)&&!/^https?:\\/\\//im.test(txt)){if(info)info.textContent="⚠ Invalid M3U/M3U8 content";return;}uploadedM3uName=f.name;uploadedM3uRaw=txt;if(info)info.textContent="✓ Ready: "+f.name+" ("+Math.round(txt.length/1024)+" KB)";};r.readAsText(f);}',
         'function handleSubFileSelect(){var inp=document.getElementById("subFile");var info=document.getElementById("subFileInfo");var f=inp&&inp.files?inp.files[0]:null;uploadedSubName="";uploadedSubRaw="";if(!f){if(info)info.textContent="No subtitle file selected";return;}if(!/\\.(srt|vtt)$/i.test(f.name)){if(info)info.textContent="⚠ Please choose a .srt or .vtt file";return;}if(f.size>5242880){if(info)info.textContent="⚠ Subtitle file exceeds 5 MB limit";return;}if(info)info.textContent="Reading "+f.name+"...";var r=new FileReader();r.onload=function(){var txt=String(r.result||"");var cues=txt.match(/-->/g);if(!cues||cues.length===0){if(info)info.textContent="⚠ Invalid subtitle file (no cue timestamps found)";return;}uploadedSubName=f.name;uploadedSubRaw=txt;var lbl=document.getElementById("subName");if(lbl&&!lbl.value){lbl.value=f.name.replace(/\\.(srt|vtt)$/i,"");}if(info)info.textContent="✓ Ready: "+f.name+" ("+Math.max(1,Math.round(txt.length/1024))+" KB • ~"+cues.length+" cues)";};r.readAsText(f);}',
         'function handleBackupFileSelect(){var inp=document.getElementById("backupFile");var info=document.getElementById("backupFileInfo");var f=inp&&inp.files?inp.files[0]:null;uploadedBackupRaw="";if(!f){if(info)info.textContent="No backup file selected (or paste JSON below)";return;}if(!/\\.json$/i.test(f.name)&&f.type!=="application/json"){if(info)info.textContent="⚠ Please select a .json backup file";return;}if(f.size>5242880){if(info)info.textContent="⚠ Backup file exceeds 5 MB limit";return;}if(info)info.textContent="Reading "+f.name+"...";var r=new FileReader();r.onload=function(){var txt=String(r.result||"");try{var parsed=JSON.parse(txt);if(!parsed||typeof parsed!=="object"||(!parsed.storage&&!Array.isArray(parsed.profiles))){throw new Error("Missing storage/profiles");}}catch(ex){if(info)info.textContent="⚠ Invalid VortixTV backup JSON: "+ex.message;return;}uploadedBackupRaw=txt;var ta=document.getElementById("backupJson");if(ta){ta.value=txt;}var pLen=Array.isArray(parsed.profiles)?parsed.profiles.length:0;if(info)info.textContent="✓ Ready: "+f.name+" ("+pLen+" profile(s))";};r.readAsText(f);}',
         'function pushSubtitle(){var pin=document.getElementById("pin").value;var st=document.getElementById("subStatus");if(!uploadedSubRaw){st.textContent="⚠ Choose a valid .srt or .vtt file first.";return;}st.textContent="⏳ Uploading "+uploadedSubName+"...";fetch("/remote-setup",{method:"POST",headers:{"Content-Type":"application/json","X-Vortix-Pin":pin},body:JSON.stringify({action:"upload_subtitle",pin:pin,name:document.getElementById("subName").value,fileName:uploadedSubName,rawText:uploadedSubRaw})}).then(function(r){return r.json();}).then(function(d){st.textContent=d.ok?"✓ Subtitle sent to TV ("+d.fileName+")! Open Audio/Subs or play a video to display.":"✕ "+(d.error||"Upload failed");}).catch(function(e){st.textContent="✕ "+e.message;});}',
@@ -1300,6 +1516,9 @@ function unregisterCatalogAbort(fn) {
 function resetAllProxySessions() {
     endpointCache = {};
     cookieJar = {};
+    safeDnsCache = {};
+    xmltvCompactCache = {};
+    xmltvCompactCacheKeys = [];
     lastPortalReferer = '';
     lastActiveMac = '';
     if (activeCatalogAbortFns.length > 0) {
@@ -1638,14 +1857,63 @@ function normalizeXmltvKeyProxy(val) {
         .replace(/[\s\u00A0\-_.:\/\\|()[\]{}'",+!?@#%^&*=~\x60<>]+/g, '');
 }
 
+function stripChannelNameForEpgProxy(rawName) {
+    return String(rawName || '')
+        .replace(/^\s*(?:\[[A-Z0-9]{2,6}\]|\([A-Z0-9]{2,6}\)|\|[A-Z0-9]{2,6}\||[A-Z]{2,3}\s*[:|\-])\s*/i, '')
+        .replace(/[\[\(]\s*(?:FHD|UHD|4K|HD|SD|1080p|720p|480p|HEVC|H\.?265|H\.?264|RAW|VIP|DRM|BACKUP|MULTI|AUTO|LQ|HQ|50FPS|60FPS|LIVE)\s*[\]\)]/gi, ' ')
+        .replace(/\b(?:FHD|UHD|4K|HD|SD|1080p|720p|480p|HEVC|H265|H264|RAW|VIP|DRM|BACKUP|MULTI|AUTO|LQ|HQ|50FPS|60FPS)\b/gi, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+function buildXmltvLookupTokensProxy(rawStr, isChannelId) {
+    var s = String(rawStr || '').trim();
+    if (!s) {
+        return [];
+    }
+    var out = [];
+    var seen = {};
+    function add(val) {
+        var norm = normalizeXmltvKeyProxy(val);
+        if (norm && !seen[norm]) {
+            seen[norm] = true;
+            out.push(norm);
+        }
+    }
+    add(s);
+    if (isChannelId) {
+        var dotIdx = s.indexOf('.');
+        if (dotIdx > 0) {
+            add(s.slice(0, dotIdx));
+            var noTld = s.replace(/\.[a-z0-9]{2,12}$/i, '').trim();
+            if (noTld && noTld !== s) {
+                add(noTld);
+            }
+        }
+        var atIdx = s.indexOf('@');
+        if (atIdx > 0) {
+            add(s.slice(0, atIdx));
+        }
+        var prefixNum = s.match(/^(?:ts|ch|jio|tp|sl|tv|id|epg)[_-]?(\d{1,6})(?:\.[a-z0-9_-]+)?$/i);
+        if (prefixNum && prefixNum[1]) {
+            add(prefixNum[1]);
+        }
+    }
+    var stripped = stripChannelNameForEpgProxy(s);
+    if (stripped && stripped !== s) {
+        add(stripped);
+    }
+    return out;
+}
+
 function parseXmltvDateSecProxy(raw) {
     var s = String(raw || '').trim();
     if (!s) {
         return 0;
     }
-    var m = s.match(/^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})?(?:\s*(Z|UTC|GMT|[+-]\d{2}:?\d{2}|[+-]\d{2}))?/i);
+    var m = s.match(/^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})?(?:\s*(?:(?:UTC|GMT)\s*([+-]\d{2}:?\d{2}|[+-]\d{2})|(Z|UTC|GMT|[+-]\d{2}:?\d{2}|[+-]\d{2})))?/i);
     if (!m) {
-        var iso = s.match(/^(\d{4})-(\d{2})-(\d{2})[T\s](\d{2}):(\d{2})(?::(\d{2}))?(?:\.\d+)?(?:\s*(Z|UTC|GMT|[+-]\d{2}:?\d{2}|[+-]\d{2}))?/i);
+        var iso = s.match(/^(\d{4})-(\d{2})-(\d{2})[T\s](\d{2}):(\d{2})(?::(\d{2}))?(?:\.\d+)?(?:\s*(?:(?:UTC|GMT)\s*([+-]\d{2}:?\d{2}|[+-]\d{2})|(Z|UTC|GMT|[+-]\d{2}:?\d{2}|[+-]\d{2})))?/i);
         if (!iso) {
             return 0;
         }
@@ -1658,7 +1926,7 @@ function parseXmltvDateSecProxy(raw) {
     var min = parseInt(m[5], 10);
     var sec = m[6] ? parseInt(m[6], 10) : 0;
     var utcMs = Date.UTC(year, month, day, hour, min, sec);
-    var tz = m[7] ? String(m[7]).toUpperCase() : '';
+    var tz = String(m[7] || m[8] || '').toUpperCase();
     if (tz && tz !== 'Z' && tz !== 'UTC' && tz !== 'GMT') {
         var sign = tz.charAt(0) === '-' ? -1 : 1;
         var digits = tz.slice(1).replace(':', '');
@@ -1682,56 +1950,103 @@ function compareXmltvProgByStartProxy(a, b) {
 var xmltvCompactCache = {};
 var xmltvCompactCacheKeys = [];
 
-function parseXmltvCompact(xmlText, nowSecOverride) {
-    var text = String(xmlText || '');
-    if (text.charCodeAt(0) === 0xFEFF) {
-        text = text.slice(1);
-    }
+function createStreamingXmltvParser(nowSecOverride, filterTokenList) {
     var channelsById = {};
-    var aliasToChannelId = {};
     var programsByChannel = {};
     var fallbackByChannel = {};
-    var hasLowerProg = text.indexOf('<programme') !== -1;
-    var hasAnyProg = hasLowerProg || /<programme\b/i.test(text);
-    if (!text || !hasAnyProg) {
-        return {
-            ok: true,
-            channelsById: channelsById,
-            aliasToChannelId: aliasToChannelId,
-            programsByChannel: programsByChannel
-        };
-    }
     var nowSec = typeof nowSecOverride === 'number' && nowSecOverride > 0 ? nowSecOverride : Math.floor(Date.now() / 1000);
-    var minStopSec = nowSec - 86400;
-    var maxStartSec = nowSec + 259200;
-    var dnRe = /<display-name\b[^>]*>([\s\S]*?)<\/display-name>/gi;
-    var chRe = /<channel\b([^>]*)>([\s\S]*?)<\/channel>/gi;
-    var chMatch;
-    while ((chMatch = chRe.exec(text)) !== null) {
-        var rawId = extractXmlAttrProxy(chMatch[1] || '', 'id');
-        if (!rawId) {
-            continue;
-        }
-        var chBody = chMatch[2] || '';
-        var names = [];
-        dnRe.lastIndex = 0;
-        var dnMatch;
-        while ((dnMatch = dnRe.exec(chBody)) !== null) {
-            var dn = extractXmlElementTextProxy(dnMatch[1]);
-            if (dn) {
-                names.push(dn);
+    var minStopSec = nowSec - 43200;
+    var maxStartSec = nowSec + 172800;
+    var filterSet = null;
+    if (Array.isArray(filterTokenList) && filterTokenList.length > 0) {
+        filterSet = {};
+        for (var ft = 0; ft < filterTokenList.length; ft++) {
+            var tok = normalizeXmltvKeyProxy(filterTokenList[ft]);
+            if (tok) {
+                filterSet[tok] = true;
             }
+        }
+        if (Object.keys(filterSet).length === 0) {
+            filterSet = null;
+        }
+    }
+    var allowedChannelIds = filterSet ? {} : null;
+    var rejectedChannelIds = filterSet ? {} : null;
+    var dnRe = /<display-name\b[^>]*>([\s\S]*?)<\/display-name>/gi;
+    var titleRe = /<title\b[^>]*>([\s\S]*?)<\/title>/i;
+    var descRe = /<desc\b[^>]*>([\s\S]*?)<\/desc>/i;
+    var progIdx = 0;
+    var maxProgsPerChannel = filterSet ? 96 : 64;
+    var maxFallbackPerChannel = 24;
+    var leftover = '';
+
+    function matchesFilterTokens(rawStr, isChannelId) {
+        if (!filterSet) {
+            return true;
+        }
+        var toks = buildXmltvLookupTokensProxy(rawStr, isChannelId);
+        for (var i = 0; i < toks.length; i++) {
+            if (filterSet[toks[i]]) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    function isChannelAllowedForProg(chId) {
+        if (!filterSet) {
+            return true;
+        }
+        if (allowedChannelIds[chId]) {
+            return true;
+        }
+        if (rejectedChannelIds[chId]) {
+            return false;
+        }
+        if (matchesFilterTokens(chId, true)) {
+            allowedChannelIds[chId] = true;
+            return true;
+        }
+        rejectedChannelIds[chId] = true;
+        return false;
+    }
+
+    function handleChannelBlock(attrsPart, chBody) {
+        var rawId = extractXmlAttrProxy(attrsPart, 'id');
+        if (!rawId) {
+            return;
+        }
+        var names = [];
+        if (chBody) {
+            dnRe.lastIndex = 0;
+            var dnMatch;
+            while ((dnMatch = dnRe.exec(chBody)) !== null) {
+                var dn = extractXmlElementTextProxy(dnMatch[1]);
+                if (dn) {
+                    names.push(dn);
+                }
+            }
+        }
+        if (filterSet) {
+            var matched = matchesFilterTokens(rawId, true);
+            for (var n = 0; !matched && n < names.length; n++) {
+                if (matchesFilterTokens(names[n], false)) {
+                    matched = true;
+                }
+            }
+            if (!matched) {
+                rejectedChannelIds[rawId] = true;
+                return;
+            }
+            allowedChannelIds[rawId] = true;
+            delete rejectedChannelIds[rawId];
         }
         channelsById[rawId] = { id: rawId, displayNames: names };
     }
 
-    var titleRe = /<title\b[^>]*>([\s\S]*?)<\/title>/i;
-    var descRe = /<desc\b[^>]*>([\s\S]*?)<\/desc>/i;
-    var progIdx = 0;
-
-    function pushProgramme(attrsPart, pBody) {
+    function handleProgrammeBlock(attrsPart, pBody) {
         var chId = extractXmlAttrProxy(attrsPart, 'channel');
-        if (!chId) {
+        if (!chId || !isChannelAllowedForProg(chId)) {
             return;
         }
         var startTs = parseXmltvDateSecProxy(extractXmlAttrProxy(attrsPart, 'start'));
@@ -1747,7 +2062,7 @@ function parseXmltvCompact(xmlText, nowSecOverride) {
             if (!programsByChannel[chId]) {
                 programsByChannel[chId] = [];
             }
-            if (programsByChannel[chId].length >= 160) {
+            if (programsByChannel[chId].length >= maxProgsPerChannel) {
                 return;
             }
         } else {
@@ -1757,7 +2072,7 @@ function parseXmltvCompact(xmlText, nowSecOverride) {
             if (!fallbackByChannel[chId]) {
                 fallbackByChannel[chId] = [];
             }
-            if (fallbackByChannel[chId].length >= 40) {
+            if (fallbackByChannel[chId].length >= maxFallbackPerChannel) {
                 return;
             }
         }
@@ -1765,6 +2080,9 @@ function parseXmltvCompact(xmlText, nowSecOverride) {
         var dM = pBody.match(descRe);
         var title = tM ? extractXmlElementTextProxy(tM[1]) : 'Program';
         var descr = dM ? extractXmlElementTextProxy(dM[1]) : '';
+        if (descr.length > 280) {
+            descr = descr.slice(0, 277) + '...';
+        }
         progIdx++;
         var entry = {
             id: 'xmltv_' + progIdx,
@@ -1780,91 +2098,162 @@ function parseXmltvCompact(xmlText, nowSecOverride) {
         }
     }
 
-    if (hasLowerProg) {
+    function feedChunk(chunkStr) {
+        var s = String(chunkStr || '');
+        if (!s) {
+            return;
+        }
+        if (!leftover && s.charCodeAt(0) === 0xFEFF) {
+            s = s.slice(1);
+        }
+        var buf = leftover + s;
+        var lowBuf = buf.toLowerCase();
         var cursor = 0;
-        var textLen = text.length;
-        while (cursor < textLen) {
-            var pStart = text.indexOf('<programme', cursor);
-            if (pStart === -1) {
-                break;
+        var len = buf.length;
+        while (cursor < len) {
+            var nextCh = lowBuf.indexOf('<channel', cursor);
+            var nextPr = lowBuf.indexOf('<programme', cursor);
+            var tagPos = -1;
+            var isProg = false;
+            if (nextCh !== -1 && (nextPr === -1 || nextCh < nextPr)) {
+                tagPos = nextCh;
+                isProg = false;
+            } else if (nextPr !== -1) {
+                tagPos = nextPr;
+                isProg = true;
+            } else {
+                var tailKeep = Math.min(20, len - cursor);
+                leftover = buf.slice(len - tailKeep);
+                return;
             }
-            var afterTagChar = text.charAt(pStart + 10);
-            if (afterTagChar && afterTagChar !== ' ' && afterTagChar !== '\t' && afterTagChar !== '\r' && afterTagChar !== '\n' && afterTagChar !== '>') {
-                cursor = pStart + 10;
+            var tagNameLen = isProg ? 10 : 8;
+            if (tagPos + tagNameLen >= len) {
+                leftover = buf.slice(tagPos);
+                return;
+            }
+            var nextChar = buf.charAt(tagPos + tagNameLen);
+            if (nextChar !== ' ' && nextChar !== '\t' && nextChar !== '\r' && nextChar !== '\n' && nextChar !== '>' && nextChar !== '/') {
+                cursor = tagPos + tagNameLen;
                 continue;
             }
-            var gtIdx = text.indexOf('>', pStart + 10);
+            var gtIdx = buf.indexOf('>', tagPos + tagNameLen);
             if (gtIdx === -1) {
-                break;
+                leftover = buf.slice(tagPos);
+                return;
             }
-            var closeIdx = text.indexOf('</programme>', gtIdx + 1);
+            var isSelfClosing = (gtIdx > tagPos + tagNameLen && buf.charAt(gtIdx - 1) === '/');
+            if (isSelfClosing) {
+                var scAttrs = buf.slice(tagPos + tagNameLen, gtIdx - 1);
+                if (!isProg) {
+                    handleChannelBlock(scAttrs, '');
+                }
+                cursor = gtIdx + 1;
+                continue;
+            }
+            var closeTag = isProg ? '</programme>' : '</channel>';
+            var closeIdx = lowBuf.indexOf(closeTag, gtIdx + 1);
             if (closeIdx === -1) {
-                break;
+                if ((len - tagPos) > 131072) {
+                    cursor = gtIdx + 1;
+                    continue;
+                }
+                leftover = buf.slice(tagPos);
+                return;
             }
-            pushProgramme(text.slice(pStart + 10, gtIdx), text.slice(gtIdx + 1, closeIdx));
-            cursor = closeIdx + 12;
+            var attrsPart = buf.slice(tagPos + tagNameLen, gtIdx);
+            var innerBody = buf.slice(gtIdx + 1, closeIdx);
+            if (isProg) {
+                handleProgrammeBlock(attrsPart, innerBody);
+            } else {
+                handleChannelBlock(attrsPart, innerBody);
+            }
+            cursor = closeIdx + closeTag.length;
         }
-    } else {
-        var progRe = /<programme\b([^>]*)>([\s\S]*?)<\/programme>/gi;
-        var progMatch;
-        while ((progMatch = progRe.exec(text)) !== null) {
-            pushProgramme(progMatch[1] || '', progMatch[2] || '');
-        }
+        leftover = '';
     }
 
-    var fbKeys = Object.keys(fallbackByChannel);
-    for (var fi = 0; fi < fbKeys.length; fi++) {
-        var fk = fbKeys[fi];
-        if (!programsByChannel[fk] || programsByChannel[fk].length === 0) {
-            programsByChannel[fk] = fallbackByChannel[fk];
-        }
-    }
-
-    var progKeyByNorm = {};
-    var pKeys = Object.keys(programsByChannel);
-    for (var pk = 0; pk < pKeys.length; pk++) {
-        var chKey = pKeys[pk];
-        var arr = programsByChannel[chKey];
-        if (!arr || arr.length === 0) {
-            delete programsByChannel[chKey];
-            continue;
-        }
-        arr.sort(compareXmltvProgByStartProxy);
-        var normPk = normalizeXmltvKeyProxy(chKey);
-        if (normPk && !progKeyByNorm[normPk]) {
-            progKeyByNorm[normPk] = chKey;
-        }
-        if (normPk && !aliasToChannelId[normPk]) {
-            aliasToChannelId[normPk] = chKey;
-        }
-    }
-
-    var cIds = Object.keys(channelsById);
-    for (var ci = 0; ci < cIds.length; ci++) {
-        var cid = cIds[ci];
-        var normCid = normalizeXmltvKeyProxy(cid);
-        var resolvedProgKey = programsByChannel[cid] ? cid : (normCid ? progKeyByNorm[normCid] : '');
-        if (!resolvedProgKey || !programsByChannel[resolvedProgKey]) {
-            continue;
-        }
-        if (normCid) {
-            aliasToChannelId[normCid] = resolvedProgKey;
-        }
-        var dNames = channelsById[cid].displayNames || [];
-        for (var dnIdx = 0; dnIdx < dNames.length; dnIdx++) {
-            var normDn = normalizeXmltvKeyProxy(dNames[dnIdx]);
-            if (normDn && !aliasToChannelId[normDn]) {
-                aliasToChannelId[normDn] = resolvedProgKey;
+    function finalize() {
+        leftover = '';
+        var aliasToChannelId = {};
+        var fbKeys = Object.keys(fallbackByChannel);
+        for (var fi = 0; fi < fbKeys.length; fi++) {
+            var fk = fbKeys[fi];
+            if (!programsByChannel[fk] || programsByChannel[fk].length === 0) {
+                programsByChannel[fk] = fallbackByChannel[fk];
             }
         }
+        var progKeyByNorm = {};
+        var pKeys = Object.keys(programsByChannel);
+        for (var pk = 0; pk < pKeys.length; pk++) {
+            var chKey = pKeys[pk];
+            var arr = programsByChannel[chKey];
+            if (!arr || arr.length === 0) {
+                delete programsByChannel[chKey];
+                continue;
+            }
+            arr.sort(compareXmltvProgByStartProxy);
+            var normPk = normalizeXmltvKeyProxy(chKey);
+            if (normPk && !progKeyByNorm[normPk]) {
+                progKeyByNorm[normPk] = chKey;
+            }
+            var pkTokens = buildXmltvLookupTokensProxy(chKey, true);
+            for (var pt = 0; pt < pkTokens.length; pt++) {
+                if (!aliasToChannelId[pkTokens[pt]]) {
+                    aliasToChannelId[pkTokens[pt]] = chKey;
+                }
+            }
+        }
+        var cIds = Object.keys(channelsById);
+        for (var ci = 0; ci < cIds.length; ci++) {
+            var cid = cIds[ci];
+            var normCid = normalizeXmltvKeyProxy(cid);
+            var resolvedProgKey = programsByChannel[cid] ? cid : (normCid ? progKeyByNorm[normCid] : '');
+            if (!resolvedProgKey || !programsByChannel[resolvedProgKey]) {
+                continue;
+            }
+            var cidTokens = buildXmltvLookupTokensProxy(cid, true);
+            for (var ct = 0; ct < cidTokens.length; ct++) {
+                if (ct === 0 || !aliasToChannelId[cidTokens[ct]]) {
+                    aliasToChannelId[cidTokens[ct]] = resolvedProgKey;
+                }
+            }
+            var dNames = channelsById[cid].displayNames || [];
+            for (var dnIdx = 0; dnIdx < dNames.length; dnIdx++) {
+                var dnTokens = buildXmltvLookupTokensProxy(dNames[dnIdx], false);
+                for (var dt = 0; dt < dnTokens.length; dt++) {
+                    if (!aliasToChannelId[dnTokens[dt]]) {
+                        aliasToChannelId[dnTokens[dt]] = resolvedProgKey;
+                    }
+                }
+            }
+        }
+        return {
+            ok: true,
+            channelsById: channelsById,
+            aliasToChannelId: aliasToChannelId,
+            programsByChannel: programsByChannel
+        };
     }
 
     return {
-        ok: true,
-        channelsById: channelsById,
-        aliasToChannelId: aliasToChannelId,
-        programsByChannel: programsByChannel
+        feedChunk: feedChunk,
+        finalize: finalize
     };
+}
+
+function parseXmltvCompact(xmlText, nowSecOverride, filterTokenList) {
+    var text = String(xmlText || '');
+    if (!text) {
+        return {
+            ok: true,
+            channelsById: {},
+            aliasToChannelId: {},
+            programsByChannel: {}
+        };
+    }
+    var parser = createStreamingXmltvParser(nowSecOverride, filterTokenList);
+    parser.feedChunk(text);
+    return parser.finalize();
 }
 
 function normalizePortalKey(rawPortal, mac) {
@@ -2164,16 +2553,18 @@ function requestWithFallback(reqState, callback) {
     });
 }
 
-function rewriteManifestTagUri(line, baseStreamUrl) {
+function rewriteManifestTagUri(line, baseStreamUrl, fwdQuerySuffix) {
     var proxyBase = 'http://127.0.0.1:' + activeListenPort + '/stream?url=';
+    var suffix = fwdQuerySuffix || '';
     return line.replace(/URI="([^"]+)"/gi, function(match, uriVal) {
         var absUri = url.resolve(baseStreamUrl, uriVal);
-        return 'URI="' + proxyBase + encodeURIComponent(absUri) + '"';
+        return 'URI="' + proxyBase + encodeURIComponent(absUri) + suffix + '"';
     });
 }
 
-function rewriteM3u8Manifest(manifestText, baseStreamUrl) {
+function rewriteM3u8Manifest(manifestText, baseStreamUrl, fwdQuerySuffix) {
     var proxyBase = 'http://127.0.0.1:' + activeListenPort + '/stream?url=';
+    var suffix = fwdQuerySuffix || '';
     var lines = String(manifestText || '').split(/\r?\n/);
     var out = [];
     for (var i = 0; i < lines.length; i++) {
@@ -2184,11 +2575,11 @@ function rewriteM3u8Manifest(manifestText, baseStreamUrl) {
             continue;
         }
         if (trimmed.charAt(0) === '#') {
-            out.push(rewriteManifestTagUri(line, baseStreamUrl));
+            out.push(rewriteManifestTagUri(line, baseStreamUrl, suffix));
             continue;
         }
         var absSegmentUrl = url.resolve(baseStreamUrl, trimmed);
-        out.push(proxyBase + encodeURIComponent(absSegmentUrl));
+        out.push(proxyBase + encodeURIComponent(absSegmentUrl) + suffix);
     }
     return out.join('\n');
 }
@@ -2409,14 +2800,30 @@ function proxyVideoStream(streamUrl, clientReq, clientRes, redirectsLeft, origin
             clientRes.end(JSON.stringify({ error: ssrfErr ? ssrfErr.message : 'Blocked target' }));
             return;
         }
-        var reqQuery = (url.parse(clientReq.url || '', true) && url.parse(clientReq.url || '', true).query) || {};
+        var parsedClientReqUrl = url.parse(clientReq.url || '', true);
+        var reqQuery = (parsedClientReqUrl && parsedClientReqUrl.query) || {};
         var overrideUa = sanitizeHeaderValue((clientReq.headers && clientReq.headers['x-proxy-ua']) || reqQuery.ua || '');
         var overrideRef = sanitizeHeaderValue((clientReq.headers && clientReq.headers['x-proxy-referer']) || reqQuery.referer || reqQuery.ref || '');
+        var overrideOrigin = sanitizeHeaderValue((clientReq.headers && clientReq.headers['x-proxy-origin']) || reqQuery.origin || reqQuery.orig || '');
+        var overrideCookie = sanitizeHeaderValue((clientReq.headers && clientReq.headers['x-proxy-cookie']) || reqQuery.cookie || '');
+        var fwdQuerySuffix = '';
+        if (overrideUa) {
+            fwdQuerySuffix += '&ua=' + encodeURIComponent(overrideUa);
+        }
+        if (overrideRef) {
+            fwdQuerySuffix += '&referer=' + encodeURIComponent(overrideRef);
+        }
+        if (overrideOrigin) {
+            fwdQuerySuffix += '&origin=' + encodeURIComponent(overrideOrigin);
+        }
+        if (overrideCookie) {
+            fwdQuerySuffix += '&cookie=' + encodeURIComponent(overrideCookie);
+        }
         var isHttps = safeTarget.protocol === 'https:';
         var client = isHttps ? https : http;
         var isVodContainer = /\.(?:mkv|mp4|avi|mov)(?:\?|$)/i.test(safeTarget.path || '') || /\.(?:mkv|mp4|avi|mov)(?:\?|$)/i.test(streamUrl || '');
         var isVodStream = isVodContainer || /\/(?:movie|series)\//i.test(safeTarget.path || '') || /\/(?:movie|series)\//i.test(streamUrl || '');
-        var mergedCookie = getHostCookieHeader(safeTarget.hostname, '', lastActiveMac);
+        var mergedCookie = getHostCookieHeader(safeTarget.hostname, overrideCookie, lastActiveMac);
         var headers = {
             'User-Agent': overrideUa || (isVodStream ? VLC_UA : MAG_UA),
             'Accept': '*/*',
@@ -2431,11 +2838,14 @@ function proxyVideoStream(streamUrl, clientReq, clientRes, redirectsLeft, origin
         } else if (lastPortalReferer && !isVodStream) {
             headers.Referer = lastPortalReferer;
         }
+        if (overrideOrigin) {
+            headers.Origin = overrideOrigin;
+        }
         if (clientReq.headers.range) {
             headers.Range = clientReq.headers.range;
         }
         var hasRangeHeader = Boolean(clientReq.headers && clientReq.headers.range);
-        var isSegmentOrSubRequest = /\.m4s(\?|$)|\.aac(\?|$)|\.vtt(\?|$)/i.test(safeTarget.path || '');
+        var isSegmentOrSubRequest = /\.(?:m4s|aac|vtt|ts|m3u8|key|mp4|m4a)(\?|$)/i.test(safeTarget.path || '');
         var isDifferentStream = Boolean(activeVideoStreamKey && activeVideoStreamKey !== streamKey);
         if (!originKey && !isSegmentOrSubRequest && (isDifferentStream || (!hasRangeHeader && !isVodContainer)) && activeVideoUpReq) {
             try {
@@ -2444,7 +2854,10 @@ function proxyVideoStream(streamUrl, clientReq, clientRes, redirectsLeft, origin
             activeVideoUpReq = null;
             activeVideoStreamKey = '';
         }
-        clientRes.on('error', function() {});
+        if (!clientRes._vortixErrBound) {
+            clientRes._vortixErrBound = true;
+            clientRes.on('error', function() {});
+        }
         var accumulatedBytes = 0;
         var lastTelemetryFlushTs = Date.now();
         var telemetryFlushTimer = null;
@@ -2526,7 +2939,7 @@ function proxyVideoStream(streamUrl, clientReq, clientRes, redirectsLeft, origin
                     decodeBufferByEncoding(rawBuf, upRes.headers['content-encoding'], function(decodedBuf) {
                         var rawText = (decodedBuf || rawBuf).toString('utf8');
                         if (rawText.indexOf('#EXTM3U') !== -1) {
-                            var rewritten = rewriteM3u8Manifest(rawText, streamUrl);
+                            var rewritten = rewriteM3u8Manifest(rawText, streamUrl, fwdQuerySuffix);
                             var outBuf = allocBufferUtf8(rewritten);
                             if (!clientRes.headersSent) {
                                 clientRes.writeHead(200, {
@@ -4115,188 +4528,463 @@ function startProxyServer(port) {
         if ((parsedUrl.pathname === '/xtream' || parsedUrl.pathname === '/m3u' || parsedUrl.pathname === '/xmltv') && ((parsedUrl.query && parsedUrl.query.url) || req.headers['x-target-url'])) {
             var rawTargetUrl = String((parsedUrl.query && parsedUrl.query.url) || req.headers['x-target-url'] || '').trim();
             var isXmltvRoute = (parsedUrl.pathname === '/xmltv');
+            var isM3uRoute = (parsedUrl.pathname === '/m3u');
             var wantXmltvJson = isXmltvRoute && parsedUrl.query && String(parsedUrl.query.format || '').toLowerCase() === 'json';
-            var isTextRoute = (parsedUrl.pathname === '/m3u' || isXmltvRoute);
+            var bypassXmltvCache = isXmltvRoute && parsedUrl.query && String(parsedUrl.query.nocache || '') === '1';
+            var isTextRoute = (isM3uRoute || isXmltvRoute);
             var remoteUaOverride = sanitizeHeaderValue(req.headers['x-proxy-ua'] || (parsedUrl.query && parsedUrl.query.ua) || '');
             var remoteRefOverride = sanitizeHeaderValue(req.headers['x-proxy-referer'] || (parsedUrl.query && (parsedUrl.query.referer || parsedUrl.query.ref)) || '');
-            if (wantXmltvJson) {
-                var cachedXmlJson = xmltvCompactCache[rawTargetUrl];
-                if (cachedXmlJson && (Date.now() - cachedXmlJson.ts) < 600000) {
-                    res.writeHead(200, {
-                        'Content-Type': 'application/json; charset=utf-8',
-                        'Cache-Control': 'no-store'
-                    });
-                    res.end(cachedXmlJson.jsonStr);
-                    return;
+            var xmltvBrowserUa = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+
+            function startRemoteCatalogFetch(xmltvFilterTokens) {
+                var filterHash = '';
+                if (Array.isArray(xmltvFilterTokens) && xmltvFilterTokens.length > 0) {
+                    filterHash = '|f:' + crypto.createHash('md5').update(xmltvFilterTokens.join(',')).digest('hex').slice(0, 12);
                 }
-            }
-            var remoteDone = false;
-            var currentRemoteReq = null;
-            var abortRemoteCatalogFn = function() {
-                remoteDone = true;
-                if (currentRemoteReq) {
-                    try {
-                        currentRemoteReq.abort();
-                    } catch (eAbRem) {}
-                    currentRemoteReq = null;
+                var xmltvCacheKey = rawTargetUrl + filterHash;
+                if (wantXmltvJson && !bypassXmltvCache) {
+                    var cachedXmlJson = xmltvCompactCache[xmltvCacheKey];
+                    if (cachedXmlJson && (Date.now() - cachedXmlJson.ts) < 600000) {
+                        res.writeHead(200, {
+                            'Content-Type': 'application/json; charset=utf-8',
+                            'Cache-Control': 'no-store'
+                        });
+                        res.end(cachedXmlJson.jsonStr);
+                        return;
+                    }
                 }
-                if (!res.headersSent) {
-                    try {
-                        res.writeHead(499, { 'Content-Type': 'application/json' });
-                        res.end(JSON.stringify({ error: 'Profile switched — request aborted' }));
-                    } catch (eResAb) {}
-                }
-            };
-            registerCatalogAbort(abortRemoteCatalogFn);
-            var sendRemoteError = function(statusCode, errMsg) {
-                unregisterCatalogAbort(abortRemoteCatalogFn);
-                if (remoteDone) {
-                    return;
-                }
-                remoteDone = true;
-                if (!res.headersSent) {
-                    res.writeHead(statusCode, { 'Content-Type': 'application/json' });
-                }
-                try {
-                    res.end(JSON.stringify({ error: String(errMsg || 'Proxy error') }));
-                } catch (eEnd) {}
-            };
-            req.on('close', function() {
-                unregisterCatalogAbort(abortRemoteCatalogFn);
-                remoteDone = true;
-                if (currentRemoteReq) {
-                    try {
-                        currentRemoteReq.abort();
-                    } catch (eClose) {}
-                }
-            });
-            (function fetchRemoteWithRedirects(targetUrlStr, redirectsLeft) {
-                if (remoteDone) {
-                    return;
-                }
-                if (redirectsLeft <= 0) {
-                    sendRemoteError(502, 'Too many redirects');
-                    return;
-                }
-                validateSafeUpstreamUrl(targetUrlStr, function(ssrfErr, safeTarget) {
+                var remoteDone = false;
+                var currentRemoteReq = null;
+                var abortRemoteCatalogFn = function() {
+                    remoteDone = true;
+                    if (currentRemoteReq) {
+                        try {
+                            currentRemoteReq.abort();
+                        } catch (eAbRem) {}
+                        currentRemoteReq = null;
+                    }
+                    if (!res.headersSent) {
+                        try {
+                            res.writeHead(499, { 'Content-Type': 'application/json' });
+                            res.end(JSON.stringify({ error: 'Profile switched — request aborted' }));
+                        } catch (eResAb) {}
+                    }
+                };
+                registerCatalogAbort(abortRemoteCatalogFn);
+                var sendRemoteError = function(statusCode, errMsg) {
+                    unregisterCatalogAbort(abortRemoteCatalogFn);
                     if (remoteDone) {
                         return;
                     }
-                    if (ssrfErr || !safeTarget) {
-                        sendRemoteError(403, ssrfErr ? ssrfErr.message : 'Blocked target URL');
+                    remoteDone = true;
+                    if (!res.headersSent) {
+                        res.writeHead(statusCode, { 'Content-Type': 'application/json' });
+                    }
+                    try {
+                        res.end(JSON.stringify({ error: String(errMsg || 'Proxy error') }));
+                    } catch (eEnd) {}
+                };
+                req.on('close', function() {
+                    unregisterCatalogAbort(abortRemoteCatalogFn);
+                    remoteDone = true;
+                    if (currentRemoteReq) {
+                        try {
+                            currentRemoteReq.abort();
+                        } catch (eClose) {}
+                    }
+                });
+                function sendCompactXmltvResult(compactObj) {
+                    if (remoteDone) {
                         return;
                     }
-                    var isHttpsTarget = safeTarget.protocol === 'https:';
-                    var hClient = isHttpsTarget ? https : http;
-                    var rHdrs = {
-                        'User-Agent': remoteUaOverride || (isTextRoute ? VLC_UA : MAG_UA),
-                        'Accept': '*/*',
-                        'Accept-Encoding': 'gzip, deflate',
-                        'Host': safeTarget.host
-                    };
-                    if (remoteRefOverride) {
-                        rHdrs.Referer = remoteRefOverride;
+                    remoteDone = true;
+                    unregisterCatalogAbort(abortRemoteCatalogFn);
+                    var compactJsonStr = JSON.stringify(compactObj);
+                    var hasPrograms = compactObj && compactObj.programsByChannel && Object.keys(compactObj.programsByChannel).length > 0;
+                    if (hasPrograms) {
+                        if (!xmltvCompactCache[xmltvCacheKey]) {
+                            xmltvCompactCacheKeys.push(xmltvCacheKey);
+                            if (xmltvCompactCacheKeys.length > 4) {
+                                var evictUrl = xmltvCompactCacheKeys.shift();
+                                delete xmltvCompactCache[evictUrl];
+                            }
+                        }
+                        xmltvCompactCache[xmltvCacheKey] = { ts: Date.now(), jsonStr: compactJsonStr };
                     }
-                    var rReq = hClient.request({
-                        hostname: safeTarget.resolvedIp || safeTarget.hostname,
-                        port: safeTarget.port,
-                        path: safeTarget.path,
-                        method: 'GET',
-                        headers: rHdrs,
-                        servername: safeTarget.hostname,
-                        agent: isHttpsTarget ? httpsAgent : httpAgent,
-                        timeout: isXmltvRoute ? 45000 : 35000,
-                        rejectUnauthorized: false
-                    }, function(rRes) {
-                        if ([301, 302, 303, 307, 308].indexOf(rRes.statusCode) !== -1 && rRes.headers.location) {
-                            rRes.resume();
-                            fetchRemoteWithRedirects(url.resolve(targetUrlStr, rRes.headers.location), redirectsLeft - 1);
+                    if (!res.headersSent) {
+                        res.writeHead(200, {
+                            'Content-Type': 'application/json; charset=utf-8',
+                            'Cache-Control': 'no-store'
+                        });
+                    }
+                    res.end(compactJsonStr);
+                }
+
+                (function fetchRemoteWithRedirects(targetUrlStr, redirectsLeft, uaAttemptIdx) {
+                    if (remoteDone) {
+                        return;
+                    }
+                    if (redirectsLeft <= 0) {
+                        sendRemoteError(502, 'Too many redirects');
+                        return;
+                    }
+                    validateSafeUpstreamUrl(targetUrlStr, function(ssrfErr, safeTarget) {
+                        if (remoteDone) {
                             return;
                         }
-                        var rChunks = [];
-                        var totalLen = 0;
-                        var maxDownloadBytes = isTextRoute ? 104857600 : 67108864;
-                        rRes.on('data', function(c) {
-                            if (remoteDone) {
-                                rChunks = [];
+                        if (ssrfErr || !safeTarget) {
+                            sendRemoteError(403, ssrfErr ? ssrfErr.message : 'Blocked target URL');
+                            return;
+                        }
+                        var isHttpsTarget = safeTarget.protocol === 'https:';
+                        var hClient = isHttpsTarget ? https : http;
+                        var chosenUa = remoteUaOverride || (isXmltvRoute ? xmltvBrowserUa : (isTextRoute ? VLC_UA : MAG_UA));
+                        if (isXmltvRoute && uaAttemptIdx === 1) {
+                            chosenUa = VLC_UA;
+                        } else if (isM3uRoute && uaAttemptIdx === 1) {
+                            chosenUa = xmltvBrowserUa;
+                        }
+                        var rHdrs = {
+                            'User-Agent': chosenUa,
+                            'Accept': isXmltvRoute ? 'application/xml,text/xml,application/gzip,application/x-gzip,*/*' : '*/*',
+                            'Accept-Encoding': 'gzip, deflate',
+                            'Host': safeTarget.host
+                        };
+                        if (remoteRefOverride && (!isTextRoute || uaAttemptIdx === 0)) {
+                            var sendRef = true;
+                            if (isXmltvRoute) {
                                 try {
-                                    rReq.abort();
-                                } catch (eChunkAb) {}
-                                return;
-                            }
-                            var bufC = Buffer.isBuffer(c) ? c : allocBufferUtf8(c);
-                            totalLen += bufC.length;
-                            if (totalLen <= maxDownloadBytes) {
-                                rChunks.push(bufC);
-                            }
-                        });
-                        rRes.on('end', function() {
-                            unregisterCatalogAbort(abortRemoteCatalogFn);
-                            if (remoteDone) {
-                                rChunks = [];
-                                return;
-                            }
-                            var bodyBuf = Buffer.concat(rChunks);
-                            rChunks = [];
-                            var decoderFn = isTextRoute ? decompressArchiveOrEncodingBuffer : decodeBufferByEncoding;
-                            decoderFn(bodyBuf, rRes.headers['content-encoding'], function(decodedBuf) {
-                                var finalBuf = decodedBuf || bodyBuf;
-                                bodyBuf = null;
-                                if (remoteDone) {
-                                    return;
+                                    var refParsed = url.parse(remoteRefOverride);
+                                    if (refParsed && refParsed.hostname && refParsed.hostname.toLowerCase() !== safeTarget.hostname.toLowerCase()) {
+                                        sendRef = false;
+                                    }
+                                } catch (eRefP) {
+                                    sendRef = false;
                                 }
-                                remoteDone = true;
-                                var upstreamStatus = rRes.statusCode || 200;
-                                if (wantXmltvJson && upstreamStatus >= 200 && upstreamStatus < 300) {
-                                    var compactObj = parseXmltvCompact(finalBuf.toString('utf8'));
-                                    var compactJsonStr = JSON.stringify(compactObj);
-                                    if (!xmltvCompactCache[rawTargetUrl]) {
-                                        xmltvCompactCacheKeys.push(rawTargetUrl);
-                                        if (xmltvCompactCacheKeys.length > 2) {
-                                            var evictUrl = xmltvCompactCacheKeys.shift();
-                                            delete xmltvCompactCache[evictUrl];
+                            }
+                            if (sendRef) {
+                                rHdrs.Referer = remoteRefOverride;
+                            }
+                        }
+                        var rReq = hClient.request({
+                            hostname: safeTarget.resolvedIp || safeTarget.hostname,
+                            port: safeTarget.port,
+                            path: safeTarget.path,
+                            method: 'GET',
+                            headers: rHdrs,
+                            servername: safeTarget.hostname,
+                            agent: isHttpsTarget ? httpsAgent : httpAgent,
+                            timeout: isXmltvRoute ? 60000 : 35000,
+                            rejectUnauthorized: false
+                        }, function(rRes) {
+                            if ([301, 302, 303, 307, 308].indexOf(rRes.statusCode) !== -1 && rRes.headers.location) {
+                                rRes.resume();
+                                fetchRemoteWithRedirects(url.resolve(targetUrlStr, rRes.headers.location), redirectsLeft - 1, uaAttemptIdx);
+                                return;
+                            }
+                            var upstreamStatus = rRes.statusCode || 200;
+                            if ((isXmltvRoute || isM3uRoute) && (upstreamStatus === 401 || upstreamStatus === 403 || upstreamStatus === 406) && uaAttemptIdx === 0) {
+                                rRes.resume();
+                                fetchRemoteWithRedirects(rawTargetUrl, 8, 1);
+                                return;
+                            }
+
+                            if (wantXmltvJson && upstreamStatus >= 200 && upstreamStatus < 300) {
+                                var contentEnc = String(rRes.headers['content-encoding'] || '').toLowerCase();
+                                var streamParser = createStreamingXmltvParser(undefined, xmltvFilterTokens);
+                                var utf8Dec = new StringDecoder('utf8');
+                                var innerUtf8Dec = new StringDecoder('utf8');
+                                var mode = 'detect';
+                                var detectChunks = [];
+                                var detectLen = 0;
+                                var zipChunks = [];
+                                var zipBytes = 0;
+                                var decoderStream = null;
+                                var innerDecoderStream = null;
+                                var streamFailed = false;
+                                var maxZipBytes = 104857600;
+
+                                function finishStreamedXmltv() {
+                                    if (remoteDone || streamFailed) {
+                                        return;
+                                    }
+                                    var tailA = utf8Dec.end();
+                                    if (tailA) {
+                                        streamParser.feedChunk(tailA);
+                                    }
+                                    var tailB = innerUtf8Dec.end();
+                                    if (tailB) {
+                                        streamParser.feedChunk(tailB);
+                                    }
+                                    var finalized = streamParser.finalize();
+                                    if (Object.keys(finalized.programsByChannel).length === 0 && uaAttemptIdx === 0) {
+                                        if (Array.isArray(xmltvFilterTokens) && xmltvFilterTokens.length > 0) {
+                                            xmltvFilterTokens = null;
+                                            fetchRemoteWithRedirects(rawTargetUrl, 8, 1);
+                                            return;
                                         }
+                                        fetchRemoteWithRedirects(rawTargetUrl, 8, 1);
+                                        return;
                                     }
-                                    xmltvCompactCache[rawTargetUrl] = { ts: Date.now(), jsonStr: compactJsonStr };
-                                    if (!res.headersSent) {
-                                        res.writeHead(200, {
-                                            'Content-Type': 'application/json; charset=utf-8',
-                                            'Cache-Control': 'no-store'
-                                        });
-                                    }
-                                    res.end(compactJsonStr);
-                                    return;
+                                    sendCompactXmltvResult(finalized);
                                 }
-                                if (!res.headersSent) {
-                                    res.writeHead(upstreamStatus, {
-                                        'Content-Type': isTextRoute ? 'text/plain; charset=utf-8' : 'application/json; charset=utf-8',
-                                        'Cache-Control': 'no-store'
+
+                                function attachUtf8ToParser(readableSrc) {
+                                    var chunkBufs = [];
+                                    var innerChecked = false;
+                                    readableSrc.on('data', function(decChunk) {
+                                        if (remoteDone || streamFailed) {
+                                            return;
+                                        }
+                                        var bDec = Buffer.isBuffer(decChunk) ? decChunk : allocBufferUtf8(decChunk);
+                                        if (!innerChecked) {
+                                            chunkBufs.push(bDec);
+                                            var mergedFirst = chunkBufs.length === 1 ? chunkBufs[0] : Buffer.concat(chunkBufs);
+                                            if (mergedFirst.length < 4) {
+                                                return;
+                                            }
+                                            innerChecked = true;
+                                            chunkBufs = [];
+                                            if (isGzipMagicBuffer(mergedFirst)) {
+                                                innerDecoderStream = zlib.createGunzip();
+                                                innerDecoderStream.on('data', function(d2) {
+                                                    streamParser.feedChunk(innerUtf8Dec.write(d2));
+                                                });
+                                                innerDecoderStream.on('error', function() {
+                                                    streamFailed = true;
+                                                });
+                                                innerDecoderStream.on('end', function() {
+                                                    finishStreamedXmltv();
+                                                });
+                                                innerDecoderStream.write(mergedFirst);
+                                                return;
+                                            }
+                                            streamParser.feedChunk(utf8Dec.write(mergedFirst));
+                                            return;
+                                        }
+                                        if (innerDecoderStream) {
+                                            innerDecoderStream.write(bDec);
+                                        } else {
+                                            streamParser.feedChunk(utf8Dec.write(bDec));
+                                        }
+                                    });
+                                    readableSrc.on('error', function() {
+                                        streamFailed = true;
+                                        if (!remoteDone) {
+                                            var partial = streamParser.finalize();
+                                            if (partial && partial.programsByChannel && Object.keys(partial.programsByChannel).length > 0) {
+                                                sendCompactXmltvResult(partial);
+                                            } else {
+                                                sendRemoteError(502, 'XMLTV decompression failed');
+                                            }
+                                        }
+                                    });
+                                    readableSrc.on('end', function() {
+                                        if (remoteDone || streamFailed) {
+                                            return;
+                                        }
+                                        if (!innerChecked && chunkBufs.length > 0) {
+                                            streamParser.feedChunk(utf8Dec.write(Buffer.concat(chunkBufs)));
+                                            chunkBufs = [];
+                                        }
+                                        if (innerDecoderStream) {
+                                            innerDecoderStream.end();
+                                        } else {
+                                            finishStreamedXmltv();
+                                        }
                                     });
                                 }
-                                res.end(finalBuf);
+
+                                if (contentEnc.indexOf('gzip') !== -1) {
+                                    mode = 'pipe';
+                                    decoderStream = zlib.createGunzip();
+                                    attachUtf8ToParser(decoderStream);
+                                    rRes.pipe(decoderStream);
+                                } else if (contentEnc.indexOf('deflate') !== -1) {
+                                    mode = 'pipe';
+                                    decoderStream = zlib.createInflate();
+                                    attachUtf8ToParser(decoderStream);
+                                    rRes.pipe(decoderStream);
+                                } else if (contentEnc.indexOf('br') !== -1 && typeof zlib.createBrotliDecompress === 'function') {
+                                    mode = 'pipe';
+                                    decoderStream = zlib.createBrotliDecompress();
+                                    attachUtf8ToParser(decoderStream);
+                                    rRes.pipe(decoderStream);
+                                } else {
+                                    rRes.on('data', function(rawC) {
+                                        if (remoteDone || streamFailed) {
+                                            try { rReq.abort(); } catch (eAbS) {}
+                                            return;
+                                        }
+                                        var bRaw = Buffer.isBuffer(rawC) ? rawC : allocBufferUtf8(rawC);
+                                        if (mode === 'detect') {
+                                            detectChunks.push(bRaw);
+                                            detectLen += bRaw.length;
+                                            if (detectLen < 4) {
+                                                return;
+                                            }
+                                            var headBuf = detectChunks.length === 1 ? detectChunks[0] : Buffer.concat(detectChunks);
+                                            detectChunks = [];
+                                            if (isGzipMagicBuffer(headBuf)) {
+                                                mode = 'gunzip';
+                                                decoderStream = zlib.createGunzip();
+                                                attachUtf8ToParser(decoderStream);
+                                                decoderStream.write(headBuf);
+                                                return;
+                                            }
+                                            if (headBuf.length >= 4 && headBuf[0] === 0x50 && headBuf[1] === 0x4b && headBuf[2] === 0x03 && headBuf[3] === 0x04) {
+                                                mode = 'zip';
+                                                zipChunks.push(headBuf);
+                                                zipBytes += headBuf.length;
+                                                return;
+                                            }
+                                            mode = 'plain';
+                                            streamParser.feedChunk(utf8Dec.write(headBuf));
+                                            return;
+                                        }
+                                        if (mode === 'gunzip' && decoderStream) {
+                                            decoderStream.write(bRaw);
+                                        } else if (mode === 'zip') {
+                                            zipBytes += bRaw.length;
+                                            if (zipBytes <= maxZipBytes) {
+                                                zipChunks.push(bRaw);
+                                            }
+                                        } else {
+                                            streamParser.feedChunk(utf8Dec.write(bRaw));
+                                        }
+                                    });
+                                    rRes.on('end', function() {
+                                        if (remoteDone || streamFailed) {
+                                            return;
+                                        }
+                                        if (mode === 'detect' && detectChunks.length > 0) {
+                                            var smallBuf = Buffer.concat(detectChunks);
+                                            detectChunks = [];
+                                            streamParser.feedChunk(utf8Dec.write(smallBuf));
+                                            finishStreamedXmltv();
+                                            return;
+                                        }
+                                        if (mode === 'gunzip' && decoderStream) {
+                                            decoderStream.end();
+                                            return;
+                                        }
+                                        if (mode === 'zip') {
+                                            var fullZipBuf = Buffer.concat(zipChunks);
+                                            zipChunks = [];
+                                            decompressArchiveOrEncodingBuffer(fullZipBuf, '', function(decBuf) {
+                                                var xmlStr = (decBuf || fullZipBuf).toString('utf8');
+                                                var zipParsed = parseXmltvCompact(xmlStr, undefined, xmltvFilterTokens);
+                                                if (Object.keys(zipParsed.programsByChannel).length === 0 && Array.isArray(xmltvFilterTokens) && xmltvFilterTokens.length > 0) {
+                                                    zipParsed = parseXmltvCompact(xmlStr, undefined, null);
+                                                }
+                                                sendCompactXmltvResult(zipParsed);
+                                            });
+                                            return;
+                                        }
+                                        finishStreamedXmltv();
+                                    });
+                                }
+                                rRes.on('error', function(zErr) {
+                                    sendRemoteError(502, zErr ? zErr.message : 'Upstream XMLTV response error');
+                                });
+                                return;
+                            }
+
+                            var rChunks = [];
+                            var totalLen = 0;
+                            var maxDownloadBytes = isTextRoute ? 104857600 : 67108864;
+                            rRes.on('data', function(c) {
+                                if (remoteDone) {
+                                    rChunks = [];
+                                    try {
+                                        rReq.abort();
+                                    } catch (eChunkAb) {}
+                                    return;
+                                }
+                                var bufC = Buffer.isBuffer(c) ? c : allocBufferUtf8(c);
+                                totalLen += bufC.length;
+                                if (totalLen <= maxDownloadBytes) {
+                                    rChunks.push(bufC);
+                                }
+                            });
+                            rRes.on('end', function() {
+                                unregisterCatalogAbort(abortRemoteCatalogFn);
+                                if (remoteDone) {
+                                    rChunks = [];
+                                    return;
+                                }
+                                var bodyBuf = Buffer.concat(rChunks);
+                                rChunks = [];
+                                var decoderFn = isTextRoute ? decompressArchiveOrEncodingBuffer : decodeBufferByEncoding;
+                                decoderFn(bodyBuf, rRes.headers['content-encoding'], function(decodedBuf) {
+                                    var finalBuf = decodedBuf || bodyBuf;
+                                    bodyBuf = null;
+                                    if (remoteDone) {
+                                        return;
+                                    }
+                                    remoteDone = true;
+                                    if (!res.headersSent) {
+                                        var outHeaders = {
+                                            'Content-Type': isTextRoute ? 'text/plain; charset=utf-8' : 'application/json; charset=utf-8',
+                                            'Cache-Control': 'no-store'
+                                        };
+                                        if (isM3uRoute && targetUrlStr) {
+                                            outHeaders['X-Final-Url'] = targetUrlStr;
+                                            outHeaders['Access-Control-Expose-Headers'] = 'X-Final-Url';
+                                        }
+                                        res.writeHead(upstreamStatus, outHeaders);
+                                    }
+                                    res.end(finalBuf);
+                                });
+                            });
+                            rRes.on('error', function(zErr) {
+                                rChunks = [];
+                                sendRemoteError(502, zErr ? zErr.message : 'Upstream response error');
                             });
                         });
-                        rRes.on('error', function(zErr) {
-                            rChunks = [];
-                            sendRemoteError(502, zErr ? zErr.message : 'Upstream response error');
+                        rReq.on('socket', function(sock) {
+                            guardUpstreamSocketLookup(sock, rReq);
                         });
+                        currentRemoteReq = rReq;
+                        rReq.on('error', function(eReq) {
+                            sendRemoteError(502, eReq ? eReq.message : 'Upstream connection error');
+                        });
+                        rReq.on('timeout', function() {
+                            sendRemoteError(504, 'Upstream timeout');
+                            try {
+                                rReq.abort();
+                            } catch (eTimeout) {}
+                        });
+                        rReq.end();
                     });
-                    rReq.on('socket', function(sock) {
-                        guardUpstreamSocketLookup(sock, rReq);
-                    });
-                    currentRemoteReq = rReq;
-                    rReq.on('error', function(eReq) {
-                        sendRemoteError(502, eReq ? eReq.message : 'Upstream connection error');
-                    });
-                    rReq.on('timeout', function() {
-                        sendRemoteError(504, 'Upstream timeout');
-                        try {
-                            rReq.abort();
-                        } catch (eTimeout) {}
-                    });
-                    rReq.end();
+                })(rawTargetUrl, isXmltvRoute ? 8 : 5, 0);
+            }
+
+            if (isXmltvRoute && req.method === 'POST') {
+                var filterBodyChunks = [];
+                var filterBodyBytes = 0;
+                req.on('data', function(fc) {
+                    var fb = Buffer.isBuffer(fc) ? fc : allocBufferUtf8(fc);
+                    filterBodyBytes += fb.length;
+                    if (filterBodyBytes <= 2097152) {
+                        filterBodyChunks.push(fb);
+                    }
                 });
-            })(rawTargetUrl, isXmltvRoute ? 8 : 5);
+                req.on('end', function() {
+                    var parsedTokens = null;
+                    try {
+                        var bodyObj = JSON.parse(Buffer.concat(filterBodyChunks).toString('utf8') || '{}');
+                        if (bodyObj && Array.isArray(bodyObj.filterTokens) && bodyObj.filterTokens.length > 0) {
+                            parsedTokens = bodyObj.filterTokens;
+                        }
+                    } catch (eFiltParse) {}
+                    filterBodyChunks = [];
+                    startRemoteCatalogFetch(parsedTokens);
+                });
+                return;
+            }
+
+            startRemoteCatalogFetch(null);
             return;
         }
 
@@ -4677,6 +5365,13 @@ function stopProxyServer(cb) {
         clearInterval(scheduledDvrTimer);
         scheduledDvrTimer = null;
     }
+    if (pruneTimer) {
+        clearInterval(pruneTimer);
+        pruneTimer = null;
+    }
+    try {
+        resetAllProxySessions();
+    } catch (eStopReset) {}
     if (!server) {
         if (cb) {
             cb();
@@ -4709,6 +5404,10 @@ module.exports = {
     validateAndNormalizeSubtitleUpload: validateAndNormalizeSubtitleUpload,
     decompressArchiveOrEncodingBuffer: decompressArchiveOrEncodingBuffer,
     parseXmltvCompact: parseXmltvCompact,
+    createStreamingXmltvParser: createStreamingXmltvParser,
+    parseXmltvDateSecProxy: parseXmltvDateSecProxy,
+    rewriteM3u8Manifest: rewriteM3u8Manifest,
+    resetAllProxySessions: resetAllProxySessions,
     getPairingPin: function() {
         return currentPairingPin;
     },
