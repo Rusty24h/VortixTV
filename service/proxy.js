@@ -612,6 +612,107 @@ function extractSetCookiePairsProxy(setCookieHeaders) {
     return pairs.join('; ');
 }
 
+function bindPrematureClientAbort(req, res, onAbort) {
+    var triggered = false;
+    var cleanup = function() {};
+    function triggerAbort() {
+        if (triggered) {
+            return;
+        }
+        if (res && (res.writableEnded || res.finished)) {
+            return;
+        }
+        triggered = true;
+        cleanup();
+        try {
+            onAbort();
+        } catch (eAbCb) {}
+    }
+    function onReqClose() {
+        if (req && req.complete) {
+            return;
+        }
+        triggerAbort();
+    }
+    function onResClose() {
+        if (res && (res.writableEnded || res.finished)) {
+            return;
+        }
+        triggerAbort();
+    }
+    function onResFinish() {
+        cleanup();
+    }
+    cleanup = function() {
+        if (req && typeof req.removeListener === 'function') {
+            req.removeListener('close', onReqClose);
+        }
+        if (res && typeof res.removeListener === 'function') {
+            res.removeListener('close', onResClose);
+            res.removeListener('finish', onResFinish);
+        }
+    };
+    if (req && typeof req.on === 'function') {
+        req.on('close', onReqClose);
+    }
+    if (res && typeof res.on === 'function') {
+        res.on('close', onResClose);
+        res.on('finish', onResFinish);
+    }
+    return cleanup;
+}
+
+function pipeFileStreamSafely(filePath, streamOpts, res) {
+    var rs = streamOpts ? fs.createReadStream(filePath, streamOpts) : fs.createReadStream(filePath);
+    var cleaned = false;
+    function destroyReadStream() {
+        if (cleaned) {
+            return;
+        }
+        cleaned = true;
+        if (res && typeof res.removeListener === 'function') {
+            res.removeListener('close', onResClose);
+            res.removeListener('finish', onResFinish);
+        }
+        try {
+            if (typeof rs.destroy === 'function') {
+                rs.destroy();
+            }
+        } catch (eRsDest) {}
+    }
+    function onResClose() {
+        if (res && (res.writableEnded || res.finished)) {
+            return;
+        }
+        destroyReadStream();
+    }
+    function onResFinish() {
+        cleaned = true;
+        if (res && typeof res.removeListener === 'function') {
+            res.removeListener('close', onResClose);
+            res.removeListener('finish', onResFinish);
+        }
+    }
+    rs.on('error', function() {
+        destroyReadStream();
+        try {
+            if (res && !res.writableEnded && !res.finished) {
+                res.end();
+            }
+        } catch (eRsEnd) {}
+    });
+    if (res && typeof res.on === 'function') {
+        if (!res._vortixErrBound) {
+            res._vortixErrBound = true;
+            res.on('error', function() {});
+        }
+        res.on('close', onResClose);
+        res.on('finish', onResFinish);
+    }
+    rs.pipe(res);
+    return rs;
+}
+
 function proxyDashAndDrmRequest(targetUrlStr, customHdrsObj, clientReq, clientRes, redirectsLeft) {
     if (redirectsLeft <= 0) {
         if (!clientRes.headersSent) {
@@ -625,7 +726,16 @@ function proxyDashAndDrmRequest(targetUrlStr, customHdrsObj, clientReq, clientRe
     var hasNoBody = (reqMethod === 'GET' || reqMethod === 'HEAD');
 
     function dispatchDashRequest(bodyBuf) {
-        (function sendHop(candidateUrl, hopsLeft, hopMethod, carriedCookies, allowClearKeyGetRetry) {
+        var isClearKeyChallengeReq = false;
+        if (reqMethod === 'POST' && bodyBuf && bodyBuf.length > 0 && bodyBuf.length <= 2048) {
+            try {
+                var ckProbeTxt = bodyBuf.toString('utf8').trim();
+                if (ckProbeTxt.charAt(0) === '{' && ckProbeTxt.indexOf('"kids"') !== -1) {
+                    isClearKeyChallengeReq = true;
+                }
+            } catch (eCkProbe) {}
+        }
+        (function sendHop(candidateUrl, hopsLeft, hopMethod, carriedCookies, allowClearKeyGetRetry, overrideUa) {
             validateSafeUpstreamUrl(candidateUrl, function(ssrfErr, safeTarget) {
                 if (ssrfErr || !safeTarget) {
                     if (!clientRes.headersSent) {
@@ -674,6 +784,7 @@ function proxyDashAndDrmRequest(targetUrlStr, customHdrsObj, clientReq, clientRe
                     referer: true,
                     'accept-encoding': true,
                     'content-length': true,
+                    'transfer-encoding': true,
                     'x-target-url': true,
                     'x-proxy-ua': true,
                     'x-proxy-referer': true,
@@ -695,12 +806,16 @@ function proxyDashAndDrmRequest(targetUrlStr, customHdrsObj, clientReq, clientRe
                         }
                     }
                 }
+                var hasExplicitCustomUa = false;
                 if (customHdrsObj && typeof customHdrsObj === 'object') {
                     var cKeys = Object.keys(customHdrsObj);
                     for (var ci = 0; ci < cKeys.length; ci++) {
                         var ck = String(cKeys[ci] || '').trim();
                         var cv = String(customHdrsObj[ck] || '').trim();
                         if (ck && cv) {
+                            if (ck.toLowerCase() === 'user-agent') {
+                                hasExplicitCustomUa = true;
+                            }
                             setHeaderCaseInsensitive(outHeaders, ck, cv);
                         }
                     }
@@ -714,7 +829,11 @@ function proxyDashAndDrmRequest(targetUrlStr, customHdrsObj, clientReq, clientRe
                 if (finalCookie) {
                     setHeaderCaseInsensitive(outHeaders, 'Cookie', finalCookie);
                 }
-                if (!hasHeaderCaseInsensitive(outHeaders, 'User-Agent')) {
+                if (overrideUa) {
+                    setHeaderCaseInsensitive(outHeaders, 'User-Agent', overrideUa);
+                } else if (isClearKeyChallengeReq && !hasExplicitCustomUa) {
+                    setHeaderCaseInsensitive(outHeaders, 'User-Agent', 'ExoPlayerLib/2.18.1');
+                } else if (!hasHeaderCaseInsensitive(outHeaders, 'User-Agent')) {
                     setHeaderCaseInsensitive(outHeaders, 'User-Agent', 'Mozilla/5.0 (SMART-TV; Linux; Tizen 5.5) AppleWebKit/537.36');
                 }
                 var sendBody = (hopMethod !== 'GET' && hopMethod !== 'HEAD' && bodyBuf && bodyBuf.length > 0) ? bodyBuf : null;
@@ -723,7 +842,8 @@ function proxyDashAndDrmRequest(targetUrlStr, customHdrsObj, clientReq, clientRe
                 } else {
                     var curCtKeys = Object.keys(outHeaders);
                     for (var delIdx = 0; delIdx < curCtKeys.length; delIdx++) {
-                        if (curCtKeys[delIdx].toLowerCase() === 'content-length') {
+                        var lowDelKey = curCtKeys[delIdx].toLowerCase();
+                        if (lowDelKey === 'content-length' || ((hopMethod === 'GET' || hopMethod === 'HEAD') && lowDelKey === 'content-type')) {
                             delete outHeaders[curCtKeys[delIdx]];
                         }
                     }
@@ -745,18 +865,19 @@ function proxyDashAndDrmRequest(targetUrlStr, customHdrsObj, clientReq, clientRe
                             clientReq._vortixActiveDashUpRes = null;
                         }
                     };
+                    var unbindDashAbort = bindPrematureClientAbort(clientReq, clientRes, onDashClientAbort);
                     clientReq._vortixDashCloseCleanup = function() {
-                        clientReq.removeListener('close', onDashClientAbort);
-                        clientRes.removeListener('close', onDashClientAbort);
+                        unbindDashAbort();
                         clientReq._vortixDashCloseCleanup = null;
                         clientReq._vortixActiveDashUpReq = null;
                         clientReq._vortixActiveDashUpRes = null;
                     };
-                    clientReq.once('close', onDashClientAbort);
-                    clientRes.once('close', onDashClientAbort);
-                    clientRes.once('finish', clientReq._vortixDashCloseCleanup);
                 }
                 cleanupDashListeners = clientReq._vortixDashCloseCleanup || function() {};
+                if (clientReq._vortixDashClientAborted || clientRes.writableEnded || clientRes.finished) {
+                    cleanupDashListeners();
+                    return;
+                }
                 if (!clientRes._vortixErrBound) {
                     clientRes._vortixErrBound = true;
                     clientRes.on('error', function() {});
@@ -802,20 +923,16 @@ function proxyDashAndDrmRequest(targetUrlStr, customHdrsObj, clientReq, clientRe
                         var nextMethod = (sc === 303 || ((sc === 301 || sc === 302) && hopMethod === 'POST')) ? 'GET' : hopMethod;
                         clientReq._vortixActiveDashUpRes = null;
                         upRes.resume();
-                        sendHop(nextLoc, hopsLeft - 1, nextMethod, nextCarried, allowClearKeyGetRetry);
+                        sendHop(nextLoc, hopsLeft - 1, nextMethod, nextCarried, allowClearKeyGetRetry, overrideUa);
                         return;
                     }
-                    if (sc === 405 && hopMethod === 'POST' && allowClearKeyGetRetry && sendBody && sendBody.length <= 2048) {
-                        var bodyTxt = '';
-                        try {
-                            bodyTxt = sendBody.toString('utf8').trim();
-                        } catch (eBodyStr) {}
-                        if (bodyTxt.charAt(0) === '{' && bodyTxt.indexOf('"kids"') !== -1) {
-                            clientReq._vortixActiveDashUpRes = null;
-                            upRes.resume();
-                            sendHop(candidateUrl, hopsLeft, 'GET', nextCarried, false);
-                            return;
-                        }
+                    if (isClearKeyChallengeReq && hopMethod === 'POST' && allowClearKeyGetRetry &&
+                        (sc === 400 || sc === 403 || sc === 404 || sc === 405 || sc === 406 || sc === 501)) {
+                        var retryUa = overrideUa || (!hasExplicitCustomUa ? 'ExoPlayerLib/2.18.1' : '');
+                        clientReq._vortixActiveDashUpRes = null;
+                        upRes.resume();
+                        sendHop(candidateUrl, hopsLeft, 'GET', nextCarried, false, retryUa);
+                        return;
                     }
                     var resHeaders = {
                         'Access-Control-Allow-Origin': '*',
@@ -878,7 +995,7 @@ function proxyDashAndDrmRequest(targetUrlStr, customHdrsObj, clientReq, clientRe
                 }
                 upReq.end();
             });
-        })(targetUrlStr, redirectsLeft, reqMethod, '', true);
+        })(targetUrlStr, redirectsLeft, reqMethod, '', true, '');
     }
 
     if (hasNoBody) {
@@ -2342,9 +2459,14 @@ function requestWithFallback(reqState, callback) {
         return;
     }
     var currentUrl = candidates[idx];
+    var sharedAbort = reqState.sharedAbort || reqState;
     var settled = false;
+    var activeProxyRes = null;
+    if (sharedAbort.aborted) {
+        return;
+    }
     validateSafeUpstreamUrl(currentUrl, function(ssrfErr, safeTarget) {
-        if (settled || reqState.aborted) {
+        if (settled || sharedAbort.aborted) {
             return;
         }
         if (ssrfErr || !safeTarget) {
@@ -2358,7 +2480,8 @@ function requestWithFallback(reqState, callback) {
                     headers: headers,
                     redirectsLeft: 3,
                     useFreshSocket: false,
-                    aborted: reqState.aborted,
+                    aborted: sharedAbort.aborted,
+                    sharedAbort: sharedAbort,
                     onAbort: reqState.onAbort
                 }, callback);
             } else {
@@ -2390,7 +2513,7 @@ function requestWithFallback(reqState, callback) {
             timeout: isCatalogQuery ? 35000 : 12000
         };
         function retryOrNextCandidate() {
-            if (settled || reqState.aborted) {
+            if (settled || sharedAbort.aborted) {
                 return;
             }
             settled = true;
@@ -2403,7 +2526,8 @@ function requestWithFallback(reqState, callback) {
                     headers: headers,
                     redirectsLeft: redirectsLeft,
                     useFreshSocket: true,
-                    aborted: reqState.aborted,
+                    aborted: sharedAbort.aborted,
+                    sharedAbort: sharedAbort,
                     onAbort: reqState.onAbort
                 }, callback);
                 return;
@@ -2416,11 +2540,19 @@ function requestWithFallback(reqState, callback) {
                 headers: headers,
                 redirectsLeft: 3,
                 useFreshSocket: false,
-                aborted: reqState.aborted,
+                aborted: sharedAbort.aborted,
+                sharedAbort: sharedAbort,
                 onAbort: reqState.onAbort
             }, callback);
         }
         var proxyReq = client.request(options, function(proxyRes) {
+            activeProxyRes = proxyRes;
+            if (settled || sharedAbort.aborted) {
+                try {
+                    proxyRes.destroy();
+                } catch (ePrDest) {}
+                return;
+            }
             storeSetCookies(safeTarget.hostname, proxyRes.headers['set-cookie'], mac);
             var status = proxyRes.statusCode;
             if ((status === 301 || status === 302 || status === 303 || status === 307 || status === 308) &&
@@ -2429,6 +2561,7 @@ function requestWithFallback(reqState, callback) {
                     return;
                 }
                 settled = true;
+                activeProxyRes = null;
                 proxyRes.resume();
                 var nextUrl = url.resolve(currentUrl, proxyRes.headers.location);
                 var redirectedList = candidates.slice();
@@ -2441,14 +2574,24 @@ function requestWithFallback(reqState, callback) {
                     headers: headers,
                     redirectsLeft: redirectsLeft - 1,
                     useFreshSocket: useFreshSocket,
-                    aborted: reqState.aborted,
+                    aborted: sharedAbort.aborted,
+                    sharedAbort: sharedAbort,
                     onAbort: reqState.onAbort
                 }, callback);
                 return;
             }
             var chunks = [];
             var totalLen = 0;
+            proxyRes.on('error', function() {
+                chunks = [];
+                activeProxyRes = null;
+                retryOrNextCandidate();
+            });
             proxyRes.on('data', function(chunk) {
+                if (settled || sharedAbort.aborted) {
+                    chunks = [];
+                    return;
+                }
                 var bufChunk = Buffer.isBuffer(chunk) ? chunk : allocBufferUtf8(chunk);
                 totalLen += bufChunk.length;
                 if (totalLen <= 67108864) {
@@ -2456,7 +2599,8 @@ function requestWithFallback(reqState, callback) {
                 }
             });
             proxyRes.on('end', function() {
-                if (settled || reqState.aborted) {
+                activeProxyRes = null;
+                if (settled || sharedAbort.aborted) {
                     chunks = [];
                     return;
                 }
@@ -2464,7 +2608,7 @@ function requestWithFallback(reqState, callback) {
                 chunks = [];
                 decodeBufferByEncoding(rawBuf, proxyRes.headers['content-encoding'], function(decodedBuf) {
                     rawBuf = null;
-                    if (settled || reqState.aborted) {
+                    if (settled || sharedAbort.aborted) {
                         return;
                     }
                     var finalBuf = decodedBuf || allocBufferUtf8('');
@@ -2527,11 +2671,18 @@ function requestWithFallback(reqState, callback) {
         });
         if (typeof reqState.onAbort === 'function') {
             reqState.onAbort(function() {
+                sharedAbort.aborted = true;
                 reqState.aborted = true;
                 settled = true;
                 try {
                     proxyReq.abort();
                 } catch (eAb) {}
+                if (activeProxyRes) {
+                    try {
+                        activeProxyRes.destroy();
+                    } catch (eAbRes) {}
+                    activeProxyRes = null;
+                }
             });
         }
         proxyReq.on('socket', function(sock) {
@@ -2786,10 +2937,10 @@ function proxyVideoStream(streamUrl, clientReq, clientRes, redirectsLeft, origin
     function markEarlyClose() {
         clientClosedEarly = true;
     }
-    clientReq.once('close', markEarlyClose);
+    var unbindEarlyAbort = bindPrematureClientAbort(clientReq, clientRes, markEarlyClose);
     validateSafeUpstreamUrl(streamUrl, function(ssrfErr, safeTarget) {
-        clientReq.removeListener('close', markEarlyClose);
-        if (clientClosedEarly) {
+        unbindEarlyAbort();
+        if (clientClosedEarly || clientRes.writableEnded || clientRes.finished) {
             return;
         }
         if (ssrfErr || !safeTarget) {
@@ -2869,6 +3020,9 @@ function proxyVideoStream(streamUrl, clientReq, clientRes, redirectsLeft, origin
                 recordStreamTelemetry(streamKey, streamUrl, { chunkLen: bytesToReport });
             }
         }
+        var unbindStreamAbort = function() {};
+        var m3u8Chunks = null;
+        var activeStreamUpRes = null;
         var upReq = client.request({
             hostname: safeTarget.resolvedIp || safeTarget.hostname,
             port: safeTarget.port,
@@ -2880,10 +3034,19 @@ function proxyVideoStream(streamUrl, clientReq, clientRes, redirectsLeft, origin
             timeout: 45000,
             rejectUnauthorized: false
         }, function(upRes) {
+            activeStreamUpRes = upRes;
+            if (clientRes.writableEnded || clientRes.finished) {
+                unbindStreamAbort();
+                try {
+                    upRes.destroy();
+                } catch (eLateClose) {}
+                return;
+            }
             var ttfb = Date.now() - reqStartTs;
             storeSetCookies(safeTarget.hostname, upRes.headers['set-cookie'], lastActiveMac);
             if ([301, 302, 303, 307, 308].indexOf(upRes.statusCode) !== -1 && upRes.headers.location) {
-                clientReq.removeListener('close', onClientClose);
+                unbindStreamAbort();
+                activeStreamUpRes = null;
                 upRes.resume();
                 proxyVideoStream(url.resolve(streamUrl, upRes.headers.location), clientReq, clientRes, redirectsLeft - 1, streamKey);
                 return;
@@ -2894,6 +3057,8 @@ function proxyVideoStream(streamUrl, clientReq, clientRes, redirectsLeft, origin
                 activeVideoStreamKey = streamKey;
             }
             upRes.on('error', function(uErr) {
+                unbindStreamAbort();
+                m3u8Chunks = null;
                 if (telemetryFlushTimer) {
                     clearTimeout(telemetryFlushTimer);
                     telemetryFlushTimer = null;
@@ -2901,7 +3066,12 @@ function proxyVideoStream(streamUrl, clientReq, clientRes, redirectsLeft, origin
                 flushAccumulatedBytes();
                 recordStreamTelemetry(streamKey, streamUrl, { err: uErr });
                 try {
-                    clientRes.end();
+                    if (!clientRes.headersSent) {
+                        clientRes.writeHead(502);
+                    }
+                    if (!clientRes.writableEnded && !clientRes.finished) {
+                        clientRes.end();
+                    }
                 } catch (eEnd) {}
             });
             var contentType = String(upRes.headers['content-type'] || '').toLowerCase();
@@ -2914,9 +3084,12 @@ function proxyVideoStream(streamUrl, clientReq, clientRes, redirectsLeft, origin
             );
 
             if (isM3u8 && (upRes.statusCode === 200 || upRes.statusCode === 206)) {
-                var m3u8Chunks = [];
+                m3u8Chunks = [];
                 var m3u8Bytes = 0;
                 upRes.on('data', function(chunk) {
+                    if (!m3u8Chunks) {
+                        return;
+                    }
                     var cBuf = Buffer.isBuffer(chunk) ? chunk : allocBufferUtf8(chunk);
                     recordStreamTelemetry(streamKey, streamUrl, { chunkLen: cBuf.length });
                     m3u8Bytes += cBuf.length;
@@ -2924,19 +3097,18 @@ function proxyVideoStream(streamUrl, clientReq, clientRes, redirectsLeft, origin
                         m3u8Chunks.push(cBuf);
                     }
                 });
-                upRes.on('error', function() {
-                    m3u8Chunks = [];
-                    if (!clientRes.headersSent) {
-                        clientRes.writeHead(502);
-                    }
-                    try {
-                        clientRes.end();
-                    } catch (eM3uErr) {}
-                });
                 upRes.on('end', function() {
+                    unbindStreamAbort();
+                    if (!m3u8Chunks || clientRes.writableEnded || clientRes.finished) {
+                        m3u8Chunks = null;
+                        return;
+                    }
                     var rawBuf = Buffer.concat(m3u8Chunks);
-                    m3u8Chunks = [];
+                    m3u8Chunks = null;
                     decodeBufferByEncoding(rawBuf, upRes.headers['content-encoding'], function(decodedBuf) {
+                        if (clientRes.writableEnded || clientRes.finished) {
+                            return;
+                        }
                         var rawText = (decodedBuf || rawBuf).toString('utf8');
                         if (rawText.indexOf('#EXTM3U') !== -1) {
                             var rewritten = rewriteM3u8Manifest(rawText, streamUrl, fwdQuerySuffix);
@@ -2981,7 +3153,9 @@ function proxyVideoStream(streamUrl, clientReq, clientRes, redirectsLeft, origin
                 resHeaders['Accept-Ranges'] = 'bytes';
             }
 
-            clientRes.writeHead(upRes.statusCode || 200, resHeaders);
+            if (!clientRes.headersSent) {
+                clientRes.writeHead(upRes.statusCode || 200, resHeaders);
+            }
             upRes.on('data', function(chunk) {
                 var len = chunk ? chunk.length : 0;
                 accumulatedBytes += len;
@@ -2996,6 +3170,7 @@ function proxyVideoStream(streamUrl, clientReq, clientRes, redirectsLeft, origin
                 }
             });
             upRes.on('end', function() {
+                unbindStreamAbort();
                 if (telemetryFlushTimer) {
                     clearTimeout(telemetryFlushTimer);
                     telemetryFlushTimer = null;
@@ -3025,6 +3200,7 @@ function proxyVideoStream(streamUrl, clientReq, clientRes, redirectsLeft, origin
             }
         });
         upReq.on('timeout', function() {
+            unbindStreamAbort();
             recordStreamTelemetry(streamKey, streamUrl, { err: new Error('Stream upstream timeout') });
             try {
                 upReq.abort();
@@ -3033,15 +3209,22 @@ function proxyVideoStream(streamUrl, clientReq, clientRes, redirectsLeft, origin
                 clientRes.writeHead(504);
             }
             try {
-                clientRes.end();
+                if (!clientRes.writableEnded && !clientRes.finished) {
+                    clientRes.end();
+                }
             } catch (eToEnd) {}
         });
         upReq.on('error', function(e) {
+            unbindStreamAbort();
             recordStreamTelemetry(streamKey, streamUrl, { err: e });
             if (!clientRes.headersSent) {
                 clientRes.writeHead(502);
             }
-            clientRes.end();
+            try {
+                if (!clientRes.writableEnded && !clientRes.finished) {
+                    clientRes.end();
+                }
+            } catch (eReqEnd) {}
         });
         function onClientClose() {
             if (telemetryFlushTimer) {
@@ -3059,8 +3242,14 @@ function proxyVideoStream(streamUrl, clientReq, clientRes, redirectsLeft, origin
             try {
                 upReq.abort();
             } catch (eCl) {}
+            if (activeStreamUpRes) {
+                try {
+                    activeStreamUpRes.destroy();
+                } catch (eClRes) {}
+                activeStreamUpRes = null;
+            }
         }
-        clientReq.once('close', onClientClose);
+        unbindStreamAbort = bindPrematureClientAbort(clientReq, clientRes, onClientClose);
         upReq.end();
     });
 }
@@ -3497,7 +3686,7 @@ function startProxyServer(port) {
                         'Content-Length': String(st.size || 0),
                         'Cache-Control': 'no-store'
                     });
-                    fs.createReadStream(dvrFileFull).pipe(res);
+                    pipeFileStreamSafely(dvrFileFull, null, res);
                 });
                 return;
             }
@@ -3816,7 +4005,15 @@ function startProxyServer(port) {
                     var sParts = [];
                     var sBytes = 0;
                     var sTooBig = false;
+                    var sErrored = false;
+                    req.on('error', function() {
+                        sErrored = true;
+                        sParts = [];
+                    });
                     req.on('data', function(ch) {
+                        if (sErrored || sTooBig) {
+                            return;
+                        }
                         var bc = Buffer.isBuffer(ch) ? ch : allocBufferUtf8(ch);
                         sBytes += bc.length;
                         if (sBytes > 65536) {
@@ -3827,6 +4024,9 @@ function startProxyServer(port) {
                         sParts.push(bc);
                     });
                     req.on('end', function() {
+                        if (sErrored) {
+                            return;
+                        }
                         if (sTooBig) {
                             res.writeHead(413, { 'Content-Type': 'application/json' });
                             res.end(JSON.stringify({ ok: false, error: 'Payload too large' }));
@@ -3947,7 +4147,7 @@ function startProxyServer(port) {
                                 res.end();
                                 return;
                             }
-                            fs.createReadStream(playFileFull, { start: start, end: end }).pipe(res);
+                            pipeFileStreamSafely(playFileFull, { start: start, end: end }, res);
                             return;
                         }
                     }
@@ -3961,7 +4161,7 @@ function startProxyServer(port) {
                         res.end();
                         return;
                     }
-                    fs.createReadStream(playFileFull).pipe(res);
+                    pipeFileStreamSafely(playFileFull, null, res);
                 });
                 return;
             }
@@ -4074,6 +4274,9 @@ function startProxyServer(port) {
                         timeout: 3200,
                         rejectUnauthorized: false
                     }, function(vRes) {
+                        vRes.on('error', function() {
+                            sendResolveResult({ ok: true, finalUrl: candidateUrl, redirected: candidateUrl !== rawVodUrl, status: 0 });
+                        });
                         var sc = Number(vRes.statusCode) || 200;
                         if ([301, 302, 303, 307, 308].indexOf(sc) !== -1 && vRes.headers && vRes.headers.location) {
                             var nextLoc = url.resolve(candidateUrl, vRes.headers.location);
@@ -4096,6 +4299,9 @@ function startProxyServer(port) {
                             contentType: cType,
                             acceptRanges: aRanges || 'bytes'
                         });
+                    });
+                    vReq.on('socket', function(sock) {
+                        guardUpstreamSocketLookup(sock, vReq);
                     });
                     vReq.on('timeout', function() {
                         try {
@@ -4571,7 +4777,9 @@ function startProxyServer(port) {
                     }
                 };
                 registerCatalogAbort(abortRemoteCatalogFn);
+                var unbindRemoteAbort = function() {};
                 var sendRemoteError = function(statusCode, errMsg) {
+                    unbindRemoteAbort();
                     unregisterCatalogAbort(abortRemoteCatalogFn);
                     if (remoteDone) {
                         return;
@@ -4584,7 +4792,7 @@ function startProxyServer(port) {
                         res.end(JSON.stringify({ error: String(errMsg || 'Proxy error') }));
                     } catch (eEnd) {}
                 };
-                req.on('close', function() {
+                unbindRemoteAbort = bindPrematureClientAbort(req, res, function() {
                     unregisterCatalogAbort(abortRemoteCatalogFn);
                     remoteDone = true;
                     if (currentRemoteReq) {
@@ -4598,6 +4806,7 @@ function startProxyServer(port) {
                         return;
                     }
                     remoteDone = true;
+                    unbindRemoteAbort();
                     unregisterCatalogAbort(abortRemoteCatalogFn);
                     var compactJsonStr = JSON.stringify(compactObj);
                     var hasPrograms = compactObj && compactObj.programsByChannel && Object.keys(compactObj.programsByChannel).length > 0;
@@ -4752,6 +4961,17 @@ function startProxyServer(port) {
                                                 });
                                                 innerDecoderStream.on('error', function() {
                                                     streamFailed = true;
+                                                    try {
+                                                        rReq.abort();
+                                                    } catch (eInAb) {}
+                                                    if (!remoteDone) {
+                                                        var partialInner = streamParser.finalize();
+                                                        if (partialInner && partialInner.programsByChannel && Object.keys(partialInner.programsByChannel).length > 0) {
+                                                            sendCompactXmltvResult(partialInner);
+                                                        } else {
+                                                            sendRemoteError(502, 'XMLTV inner decompression failed');
+                                                        }
+                                                    }
                                                 });
                                                 innerDecoderStream.on('end', function() {
                                                     finishStreamedXmltv();
@@ -4908,6 +5128,7 @@ function startProxyServer(port) {
                                 }
                             });
                             rRes.on('end', function() {
+                                unbindRemoteAbort();
                                 unregisterCatalogAbort(abortRemoteCatalogFn);
                                 if (remoteDone) {
                                     rChunks = [];
@@ -4963,7 +5184,15 @@ function startProxyServer(port) {
             if (isXmltvRoute && req.method === 'POST') {
                 var filterBodyChunks = [];
                 var filterBodyBytes = 0;
+                var filterBodyErrored = false;
+                req.on('error', function() {
+                    filterBodyErrored = true;
+                    filterBodyChunks = [];
+                });
                 req.on('data', function(fc) {
+                    if (filterBodyErrored) {
+                        return;
+                    }
                     var fb = Buffer.isBuffer(fc) ? fc : allocBufferUtf8(fc);
                     filterBodyBytes += fb.length;
                     if (filterBodyBytes <= 2097152) {
@@ -4971,6 +5200,9 @@ function startProxyServer(port) {
                     }
                 });
                 req.on('end', function() {
+                    if (filterBodyErrored) {
+                        return;
+                    }
                     var parsedTokens = null;
                     try {
                         var bodyObj = JSON.parse(Buffer.concat(filterBodyChunks).toString('utf8') || '{}');
@@ -5038,7 +5270,9 @@ function startProxyServer(port) {
                 activeAbortFn = fn;
             }
         };
+        var unbindStalkerAbort = function() {};
         var abortStalkerCatalogFn = function() {
+            unbindStalkerAbort();
             reqStateObj.aborted = true;
             if (typeof activeAbortFn === 'function') {
                 activeAbortFn();
@@ -5051,7 +5285,7 @@ function startProxyServer(port) {
             }
         };
         registerCatalogAbort(abortStalkerCatalogFn);
-        req.on('close', function() {
+        unbindStalkerAbort = bindPrematureClientAbort(req, res, function() {
             unregisterCatalogAbort(abortStalkerCatalogFn);
             reqStateObj.aborted = true;
             if (typeof activeAbortFn === 'function') {
@@ -5059,16 +5293,21 @@ function startProxyServer(port) {
             }
         });
         requestWithFallback(reqStateObj, function(err, result) {
+            unbindStalkerAbort();
             unregisterCatalogAbort(abortStalkerCatalogFn);
-            if (reqStateObj.aborted) {
+            if (reqStateObj.aborted || res.writableEnded || res.finished) {
                 return;
             }
             if (err) {
-                res.writeHead(502, { 'Content-Type': 'application/json' });
+                if (!res.headersSent) {
+                    res.writeHead(502, { 'Content-Type': 'application/json' });
+                }
                 res.end(JSON.stringify({ error: err.message }));
                 return;
             }
-            res.writeHead(200, { 'Content-Type': 'application/json' });
+            if (!res.headersSent) {
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+            }
             res.end(result);
         });
     });
@@ -5408,6 +5647,8 @@ module.exports = {
     parseXmltvDateSecProxy: parseXmltvDateSecProxy,
     rewriteM3u8Manifest: rewriteM3u8Manifest,
     resetAllProxySessions: resetAllProxySessions,
+    bindPrematureClientAbort: bindPrematureClientAbort,
+    pipeFileStreamSafely: pipeFileStreamSafely,
     getPairingPin: function() {
         return currentPairingPin;
     },
