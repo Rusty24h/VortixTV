@@ -21,10 +21,14 @@ body {
     width: 1920px;
     height: 1080px;
     z-index: 0;
-    display: none;
+    display: block;
+    visibility: hidden;
+    opacity: 0;
+    pointer-events: none;
 }
 #av-player.active {
-    display: block;
+    visibility: visible;
+    opacity: 1;
 }
 #shaka-video {
     position: absolute;
